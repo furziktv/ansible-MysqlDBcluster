@@ -1,0 +1,15 @@
+name: mysql-orchestrator
+services:
+  orchestrator:
+    image: {{ orchestrator_image }}
+    container_name: orchestrator
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - {{ orchestrator_config_dir }}/orchestrator.conf.json:/etc/orchestrator/orchestrator.conf.json:ro
+      - {{ orchestrator_data_dir }}:/var/lib/orchestrator
+    logging:
+      driver: json-file
+      options:
+        max-size: "{{ docker_log_max_size }}"
+        max-file: "{{ docker_log_max_file }}"

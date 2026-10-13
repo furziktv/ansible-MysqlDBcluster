@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Advertise the VIP only when Orchestrator sees exactly this node as the
+# recently-checked, writable replication root. Local writable state alone is
+# not sufficient to claim the service address after a topology change.
+/usr/bin/docker inspect --format='{{'{{'}}.State.Health.Status{{'}}'}}' {{ mysql_container_name }} | /bin/grep -qx healthy
+ROOT_PASSWORD="$(/bin/cat {{ mysql_secrets_dir }}/mysql_root_password)"
+/usr/bin/docker exec -e MYSQL_PWD="${ROOT_PASSWORD}" {{ mysql_container_name }} \
+  mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot -NBe \
+  'SELECT IF(@@global.read_only = 0 AND @@global.super_read_only = 0, 1, 0)' \
+  | /bin/grep -qx 1
+ORCHESTRATOR_PASSWORD="$(/bin/cat {{ orchestrator_config_dir }}/orchestrator.conf.json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["HTTPAuthPassword"])')"
+/usr/bin/curl --fail --silent --show-error --max-time 2 \
+  --user '{{ orchestrator_http_user }}:'"${ORCHESTRATOR_PASSWORD}" \
+  "http://{{ node_ip }}:{{ orchestrator_http_port }}/api/cluster/alias/{{ mysql_cluster_alias }}" \
+  | /usr/bin/jq -e --arg node '{{ node_ip }}' '
+      [ .[] | select(.ReplicationDepth == 0 and .ReadOnly == false
+        and .IsLastCheckValid == true and .IsRecentlyChecked == true) ] as $masters
+      | ($masters | length) == 1 and $masters[0].Key.Hostname == $node
+    ' >/dev/null

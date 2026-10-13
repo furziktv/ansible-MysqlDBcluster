@@ -1,0 +1,296 @@
+#!/usr/bin/python3
+"""Fail-closed replica rejoin and guarded resumption of a fenced MySQL root."""
+
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+
+MYSQL = {{ mysql_container_name | to_json }}
+REPLICA_SECRET = {{ (mysql_secrets_dir ~ '/mysql_replication_password') | to_json }}
+ORCHESTRATOR_CONFIG = {{ (orchestrator_config_dir ~ '/orchestrator.conf.json') | to_json }}
+MYSQL_ROOT = {{ mysql_compose_dir | to_json }}
+API_URL = {{ ('http://' ~ node_ip ~ ':' ~ (orchestrator_http_port | string) ~ '/api/instance/') | to_json }}
+API_PORT = {{ orchestrator_http_port }}
+CLUSTER_ALIAS = {{ mysql_cluster_alias | to_json }}
+TRUSTED_NODES = {{ cluster_nodes | to_json }}
+LOCAL_NODE = {{ node_ip | to_json }}
+MYSQL_PORT = {{ mysql_port }}
+
+
+def stop(message):
+    print("mysql-safe-rejoin: " + message)
+    raise SystemExit(0)
+
+
+def mysql(sql):
+    command = [
+        "/usr/bin/docker", "exec", "-i", MYSQL, "sh", "-c",
+        'export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)"; '
+        'exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock '
+        '-uroot -NBe "$1"', "mysql-safe-rejoin", sql,
+    ]
+    result = subprocess.run(command, text=True, capture_output=True, timeout=12)
+    if result.returncode:
+        raise RuntimeError("local MySQL query failed")
+    return result.stdout.strip()
+
+
+def sql_literal(value):
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def fresh(item):
+    age = item.get("SecondsSinceLastSeen") or {}
+    return (
+        item.get("IsLastCheckValid") is True
+        and item.get("IsRecentlyChecked") is True
+        and age.get("Valid") is True
+        and isinstance(age.get("Int64"), int)
+        and age["Int64"] <= 15
+    )
+
+
+def normalize_gtid(value):
+    return re.sub(r"\s+", "", value or "")
+
+
+def fetch_json(url, auth):
+    request = urllib.request.Request(url, headers={"Authorization": "Basic " + auth})
+    with urllib.request.urlopen(request, timeout=4) as response:
+        return json.load(response)
+
+
+try:
+    if not any(os.path.isfile(os.path.join(MYSQL_ROOT, marker)) for marker in (
+        "replication-seed-ready", "replication-replica-ready"
+    )):
+        stop("no recognized replication ownership marker; refusing automatic rejoin")
+
+    with open(ORCHESTRATOR_CONFIG, encoding="utf-8") as handle:
+        config = json.load(handle)
+    with open(REPLICA_SECRET, encoding="utf-8") as handle:
+        replication_password = handle.read().rstrip("\r\n")
+    if not replication_password:
+        stop("replication credential is empty; leaving node fenced")
+
+    auth = base64.b64encode(
+        (config["HTTPAuthUser"] + ":" + config["HTTPAuthPassword"]).encode()
+    ).decode()
+    topology = []
+    for trusted_node in TRUSTED_NODES:
+        instance = fetch_json(API_URL + trusted_node + "/" + str(MYSQL_PORT), auth)
+        if isinstance(instance, dict):
+            topology.append(instance)
+        elif isinstance(instance, list) and len(instance) == 1 and isinstance(instance[0], dict):
+            topology.extend(instance)
+        else:
+            stop("Orchestrator returned an unexpected instance record; leaving node fenced")
+
+    if len(topology) != len(TRUSTED_NODES):
+        stop("Orchestrator did not return every configured MySQL instance; leaving node fenced")
+    by_host = {}
+    for item in topology:
+        key = item.get("Key") or {}
+        host = key.get("Hostname")
+        if host not in TRUSTED_NODES or key.get("Port") != MYSQL_PORT or host in by_host:
+            stop("Orchestrator returned duplicate or untrusted instance keys; leaving node fenced")
+        by_host[host] = item
+    if set(by_host) != set(TRUSTED_NODES):
+        stop("Orchestrator instance list does not match the configured topology; leaving node fenced")
+
+    roots = []
+    for item in topology:
+        if (
+            item.get("ReplicationDepth") == 0
+            and item.get("ReadOnly") is False
+            and fresh(item)
+        ):
+            roots.append(item)
+
+    # A MySQL primary starts fenced after a restart by design (persisted
+    # read_only defaults to ON). Orchestrator reports a reachable root as
+    # depth 0 even while it is fenced, so it will not necessarily run another
+    # DeadMaster promotion. Only let that same root resume writes after all
+    # three independent Orchestrator APIs agree on the complete, fresh,
+    # read-only topology and every replica is configured directly under it.
+    # A restarted source can leave replica IO threads in CONNECTING until
+    # writes resume; requiring IO=ON here creates a recovery deadlock.
+    if not roots:
+        fenced_roots = [
+            item for item in topology
+            if item.get("ReplicationDepth") == 0
+            and item.get("ReadOnly") is True
+            and fresh(item)
+        ]
+        if len(fenced_roots) != 1:
+            stop("no unique fresh root in Orchestrator; leaving node fenced")
+        candidate = fenced_roots[0]
+        candidate_host = (candidate.get("Key") or {}).get("Hostname", "")
+        if candidate_host != LOCAL_NODE:
+            stop("the fenced root is another node; leaving this node read-only")
+        if os.path.exists(os.path.join(MYSQL_ROOT, ".block-auto-primary-resume")):
+            stop("manual primary-resume fence marker exists; leaving node read-only")
+        if not all(item.get("ReadOnly") is True and fresh(item) for item in topology):
+            stop("not every MySQL instance is freshly observed and read-only; leaving node fenced")
+
+        views = []
+        for observer in TRUSTED_NODES:
+            view = fetch_json(
+                "http://" + observer + ":" + str(API_PORT)
+                + "/api/cluster/alias/" + CLUSTER_ALIAS,
+                auth,
+            )
+            if not isinstance(view, list) or len(view) != len(TRUSTED_NODES):
+                stop("an Orchestrator member returned an incomplete cluster view; leaving node fenced")
+            view_by_host = {}
+            for item in view:
+                key = item.get("Key") or {}
+                host = key.get("Hostname")
+                if host not in TRUSTED_NODES or key.get("Port") != MYSQL_PORT or host in view_by_host:
+                    stop("an Orchestrator member returned invalid cluster keys; leaving node fenced")
+                if not fresh(item):
+                    stop("an Orchestrator member has stale instance data; leaving node fenced")
+                view_by_host[host] = item
+            if set(view_by_host) != set(TRUSTED_NODES):
+                stop("an Orchestrator member does not see every configured node; leaving node fenced")
+            view_roots = [
+                item for item in view
+                if item.get("ReplicationDepth") == 0 and item.get("ReadOnly") is True
+            ]
+            if len(view_roots) != 1 or (view_roots[0].get("Key") or {}).get("Hostname") != LOCAL_NODE:
+                stop("Orchestrator members disagree about the fenced topology root; leaving node fenced")
+            for host, item in view_by_host.items():
+                if host == LOCAL_NODE:
+                    if item.get("ReplicationDepth") != 0 or item.get("ReadOnly") is not True:
+                        stop("Orchestrator view does not identify this node as a fenced root")
+                elif (
+                    item.get("ReplicationDepth") != 1
+                    or item.get("ReadOnly") is not True
+                    or (item.get("MasterKey") or {}).get("Hostname") != LOCAL_NODE
+                    or item.get("Slave_SQL_Running") is not True
+                ):
+                    stop("a replica is not a read-only direct child with SQL applier running; leaving node fenced")
+            signature = tuple(sorted(
+                (
+                    host,
+                    item.get("ReplicationDepth"),
+                    item.get("ReadOnly"),
+                    (item.get("MasterKey") or {}).get("Hostname", ""),
+                    item.get("Slave_SQL_Running"),
+                    normalize_gtid(item.get("ExecutedGtidSet")),
+                )
+                for host, item in view_by_host.items()
+            ))
+            views.append(signature)
+        if any(signature != views[0] for signature in views[1:]):
+            stop("Orchestrator members disagree on topology or GTID state; leaving node fenced")
+
+        candidate_gtid = normalize_gtid(candidate.get("ExecutedGtidSet"))
+        if not candidate_gtid or not re.fullmatch(r"[A-Fa-f0-9:,\-]+", candidate_gtid):
+            stop("fenced root GTID set is empty or malformed; leaving node fenced")
+        local_row = mysql(
+            "SELECT @@global.read_only; "
+            "SELECT @@global.super_read_only; "
+            "SELECT HEX(@@global.gtid_executed); "
+            "SELECT COALESCE((SELECT HOST FROM performance_schema.replication_connection_configuration LIMIT 1), 'NONE')"
+        ).splitlines()
+        if len(local_row) != 4:
+            stop("local fenced-root MySQL state could not be parsed")
+        try:
+            local_gtid = normalize_gtid(bytes.fromhex(local_row[2]).decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            stop("local fenced-root GTID set could not be decoded")
+        if local_row[0] != "1" or local_row[1] != "1" or local_row[3] != "NONE":
+            stop("local MySQL is not a read-only detached root; leaving node fenced")
+        if local_gtid != candidate_gtid:
+            stop("local GTID set differs from every Orchestrator view; leaving node fenced")
+        for host, item in by_host.items():
+            if host == LOCAL_NODE:
+                continue
+            replica_gtid = normalize_gtid(item.get("ExecutedGtidSet"))
+            if not replica_gtid or not re.fullmatch(r"[A-Fa-f0-9:,\-]+", replica_gtid):
+                stop("replica GTID set is empty or malformed; leaving node fenced")
+            subset = mysql(
+                "SELECT GTID_SUBSET(" + sql_literal(replica_gtid) + ", "
+                + sql_literal(candidate_gtid) + ")"
+            )
+            if subset != "1":
+                stop("a replica has GTIDs absent from the fenced root; manual recovery required")
+        mysql("SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF")
+        stop("resumed this node as the unanimously observed GTID-compatible root")
+    if len(roots) != 1:
+        stop("multiple fresh writable roots in Orchestrator; leaving node fenced")
+
+    primary = roots[0]
+    primary_host = (primary.get("Key") or {}).get("Hostname", "")
+    primary_port = (primary.get("Key") or {}).get("Port")
+    primary_gtid = re.sub(r"\s+", "", primary.get("ExecutedGtidSet") or "")
+    if primary_host not in TRUSTED_NODES or primary_port != MYSQL_PORT:
+        stop("Orchestrator primary is outside the configured topology; leaving node fenced")
+    if primary_host == LOCAL_NODE:
+        stop("this node is the current primary; no replica rejoin is needed")
+    if not primary_gtid or not re.fullmatch(r"[A-Fa-f0-9:,\-]+", primary_gtid):
+        stop("primary GTID set is empty or malformed (length=%d); leaving node fenced" % len(primary_gtid))
+
+    row = mysql(
+        "SELECT @@global.read_only; "
+        "SELECT @@global.super_read_only; "
+        "SELECT HEX(@@global.gtid_executed); "
+        "SELECT COALESCE((SELECT HOST FROM performance_schema.replication_connection_configuration LIMIT 1), ''); "
+        "SELECT COALESCE((SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1), 'OFF'); "
+        "SELECT COALESCE((SELECT SERVICE_STATE FROM performance_schema.replication_applier_status LIMIT 1), 'OFF')"
+    )
+    fields = row.splitlines()
+    if len(fields) != 6:
+        stop("local MySQL status could not be parsed; leaving node fenced")
+    read_only, super_read_only, local_gtid_hex, current_source, io_state, sql_state = fields
+    try:
+        local_gtid = bytes.fromhex(local_gtid_hex).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        stop("local GTID set could not be decoded; leaving node fenced")
+    local_gtid = re.sub(r"\s+", "", local_gtid)
+    if read_only != "1" or super_read_only != "1":
+        stop("local node is not fully read-only; refusing automatic rejoin")
+    if current_source and current_source != primary_host:
+        stop("replication is configured to a different source; manual review required")
+    if current_source == primary_host and io_state == "ON" and sql_state == "ON":
+        stop("already replicating from the current primary")
+    if not re.fullmatch(r"[A-Fa-f0-9:,\-]*", local_gtid):
+        stop("local GTID set is malformed; leaving node fenced")
+
+    subset = mysql(
+        "SELECT GTID_SUBSET(" + sql_literal(local_gtid) + ", " + sql_literal(primary_gtid) + ")"
+    )
+    if subset != "1":
+        stop("local GTIDs are not a subset of the current primary; manual recovery required")
+
+    if current_source == primary_host:
+        mysql("START REPLICA")
+        stop("started existing replica channel; node remains read-only")
+
+    sql = (
+        "SET PERSIST replica_net_timeout={{ mysql_replica_net_timeout_seconds }};\n"
+        "CHANGE REPLICATION SOURCE TO "
+        "SOURCE_HOST=" + sql_literal(primary_host) + ", "
+        "SOURCE_PORT=" + str(MYSQL_PORT) + ", "
+        "SOURCE_USER=" + sql_literal({{ mysql_replication_user | to_json }}) + ", "
+        "SOURCE_PASSWORD=" + sql_literal(replication_password) + ", "
+        "SOURCE_AUTO_POSITION=1, "
+        "SOURCE_HEARTBEAT_PERIOD={{ mysql_replica_heartbeat_period_seconds }}, "
+        "GET_SOURCE_PUBLIC_KEY=1;\n"
+        "SET GLOBAL read_only=ON;\n"
+        "SET GLOBAL super_read_only=ON;\n"
+        "START REPLICA;"
+    )
+    mysql(sql)
+    stop("attached to current primary via GTID auto-position; node remains read-only")
+except urllib.error.URLError:
+    stop("Orchestrator API is unavailable; leaving node fenced")
+except (OSError, KeyError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+    stop("safety check failed; leaving node fenced (inspect service logs)")

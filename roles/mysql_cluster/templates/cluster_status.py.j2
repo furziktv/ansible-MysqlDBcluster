@@ -1,0 +1,11 @@
+import json
+
+ADMIN_USER = {{ mysql_cluster_admin_user | to_json }}
+ADMIN_PASS = {{ mysql_cluster_admin_password | to_json }}
+SEED = {{ node_ip | to_json }}
+PORT = {{ mysql_port }}
+
+shell.connect({"scheme": "mysql", "host": SEED, "port": PORT,
+               "user": ADMIN_USER, "password": ADMIN_PASS})
+cluster = dba.get_cluster({{ mysql_cluster_name | to_json }})
+print(json.dumps(cluster.status({"extended": 1}), sort_keys=True))

@@ -1,0 +1,43 @@
+SET GLOBAL super_read_only = OFF;
+SET GLOBAL read_only = OFF;
+SET PERSIST replica_net_timeout = {{ mysql_replica_net_timeout_seconds }};
+CREATE DATABASE IF NOT EXISTS `{{ mysql_app_database | replace('`', '``') }}`;
+
+CREATE USER IF NOT EXISTS '{{ mysql_replication_user }}'@'{{ mysql_admin_account_host }}'
+  IDENTIFIED BY '{{ mysql_replication_password | replace('\\', '\\\\') | replace("'", "\\'") }}';
+GRANT REPLICATION SLAVE ON *.* TO '{{ mysql_replication_user }}'@'{{ mysql_admin_account_host }}';
+
+CREATE USER IF NOT EXISTS '{{ mysql_orchestrator_user }}'@'{{ mysql_admin_account_host }}'
+  IDENTIFIED BY '{{ mysql_orchestrator_password | replace('\\', '\\\\') | replace("'", "\\'") }}';
+GRANT PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE, REPLICATION_SLAVE_ADMIN,
+  SYSTEM_VARIABLES_ADMIN, CONNECTION_ADMIN ON *.*
+  TO '{{ mysql_orchestrator_user }}'@'{{ mysql_admin_account_host }}';
+GRANT SELECT ON mysql.slave_master_info TO '{{ mysql_orchestrator_user }}'@'{{ mysql_admin_account_host }}';
+
+CREATE USER IF NOT EXISTS '{{ mysql_monitor_user }}'@'127.0.0.1'
+  IDENTIFIED BY '{{ mysql_monitor_password | replace('\\', '\\\\') | replace("'", "\\'") }}';
+CREATE USER IF NOT EXISTS '{{ mysql_monitor_user }}'@'{{ mysql_admin_account_host }}'
+  IDENTIFIED BY '{{ mysql_monitor_password | replace('\\', '\\\\') | replace("'", "\\'") }}';
+GRANT REPLICATION CLIENT, PROCESS ON *.* TO '{{ mysql_monitor_user }}'@'127.0.0.1';
+GRANT REPLICATION CLIENT, PROCESS ON *.* TO '{{ mysql_monitor_user }}'@'{{ mysql_admin_account_host }}';
+
+CREATE USER IF NOT EXISTS '{{ mysql_app_user }}'@'127.0.0.1'
+  IDENTIFIED BY '{{ mysql_app_password | replace('\\', '\\\\') | replace("'", "\\'") }}';
+CREATE USER IF NOT EXISTS '{{ mysql_app_user }}'@'{{ mysql_app_account_host }}'
+  IDENTIFIED BY '{{ mysql_app_password | replace('\\', '\\\\') | replace("'", "\\'") }}';
+CREATE USER IF NOT EXISTS '{{ mysql_app_user }}'@'{{ mysql_app_cluster_account_host }}'
+  IDENTIFIED BY '{{ mysql_app_password | replace('\\', '\\\\') | replace("'", "\\'") }}';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, SHOW VIEW
+  ON `{{ mysql_app_database | replace('`', '``') }}`.*
+  TO '{{ mysql_app_user }}'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, SHOW VIEW
+  ON `{{ mysql_app_database | replace('`', '``') }}`.*
+  TO '{{ mysql_app_user }}'@'{{ mysql_app_account_host }}';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, SHOW VIEW
+  ON `{{ mysql_app_database | replace('`', '``') }}`.*
+  TO '{{ mysql_app_user }}'@'{{ mysql_app_cluster_account_host }}';
+
+-- Keep all nodes fenced after reboot by default, without blocking this seed's
+-- initial writable setup. Orchestrator changes the runtime values on promotion.
+SET PERSIST_ONLY read_only = ON;
+SET PERSIST_ONLY super_read_only = ON;

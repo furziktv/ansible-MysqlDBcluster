@@ -1,0 +1,77 @@
+---
+# firewall role (UFW). SSH always allowed first to avoid lockout.
+- name: Firewall | Allow SSH only from explicitly trusted management networks
+  community.general.ufw:
+    rule: allow
+    port: "{{ firewall_ssh_port }}"
+    proto: tcp
+    from_ip: "{{ item }}"
+  loop: "{{ ssh_trusted_networks }}"
+  tags: [firewall]
+
+- name: Firewall | Allow MySQL 3306 from trusted clients and cluster peers
+  community.general.ufw:
+    rule: allow
+    port: "{{ mysql_port }}"
+    proto: tcp
+    from_ip: "{{ item }}"
+  loop: "{{ (mysql_trusted_networks + cluster_nodes) | unique | list }}"
+  tags: [firewall]
+
+- name: Firewall | Allow Orchestrator Raft between database nodes
+  community.general.ufw:
+    rule: allow
+    port: "{{ orchestrator_raft_port }}"
+    proto: tcp
+    from_ip: "{{ item }}"
+  loop: "{{ cluster_nodes }}"
+  tags: [firewall, orchestrator]
+
+- name: Firewall | Allow Orchestrator web/API from management networks only
+  community.general.ufw:
+    rule: allow
+    port: "{{ orchestrator_http_port }}"
+    proto: tcp
+    from_ip: "{{ item }}"
+  loop: "{{ ssh_trusted_networks }}"
+  tags: [firewall, orchestrator]
+
+- name: Firewall | Allow Orchestrator web/API between database nodes
+  community.general.ufw:
+    rule: allow
+    port: "{{ orchestrator_http_port }}"
+    proto: tcp
+    from_ip: "{{ item }}"
+  loop: "{{ cluster_nodes }}"
+  tags: [firewall, orchestrator]
+
+- name: Firewall | Allow VRRP (protocol 112) between cluster nodes
+  community.general.ufw:
+    rule: allow
+    proto: vrrp
+    from_ip: "{{ item }}"
+  loop: "{{ cluster_nodes }}"
+  tags: [firewall, keepalived]
+
+- name: Firewall | Inspect configured UFW rules, including inactive policy
+  ansible.builtin.command: ufw show added
+  register: _firewall_ufw_status
+  changed_when: false
+  tags: [firewall]
+
+- name: Firewall | Refuse to leave a pre-existing global SSH allow rule in place
+  ansible.builtin.assert:
+    that:
+      - not (_firewall_ufw_status.stdout is search('(?m)^ufw (allow|limit) (22/tcp|OpenSSH)(?:\\s|$)'))
+    fail_msg: >-
+      MANUAL INTERVENTION REQUIRED: UFW has an unrestricted SSH allow rule.
+      Verify ssh_trusted_networks includes this Ansible controller, then remove
+      the broad rule explicitly before re-running the firewall role.
+  tags: [firewall]
+
+- name: Firewall | Enable UFW with default deny incoming
+  community.general.ufw:
+    state: enabled
+    policy: deny
+    direction: incoming
+  tags: [firewall]

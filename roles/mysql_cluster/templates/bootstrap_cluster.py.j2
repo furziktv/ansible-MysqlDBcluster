@@ -1,0 +1,51 @@
+import json
+
+NAME = {{ mysql_cluster_name | to_json }}
+USER = {{ mysql_cluster_admin_user | to_json }}
+PASSWORD = {{ mysql_cluster_admin_password | to_json }}
+PORT = {{ mysql_port }}
+MEMBERS = {{ groups['mysql_cluster'] | map('extract', hostvars, 'node_ip') | list | to_json }}
+
+def connection(host):
+    return {"scheme": "mysql", "host": host, "port": PORT,
+            "user": USER, "password": PASSWORD}
+
+seed = MEMBERS[0]
+shell.connect(connection(seed))
+s = shell.get_session()
+try:
+    cluster = dba.get_cluster(NAME)
+    print("CLUSTER_ALREADY_EXISTS")
+except Exception as exc:
+    metadata = int(s.run_sql("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='mysql_innodb_cluster_metadata'").fetch_one()[0])
+    # An inactive standalone server can expose one placeholder row with an
+    # empty or NULL MEMBER_ID and OFFLINE state. Only real member IDs indicate
+    # existing Group Replication state that must not be adopted automatically.
+    members = int(s.run_sql(
+        "SELECT COUNT(*) FROM performance_schema.replication_group_members "
+        "WHERE MEMBER_ID IS NOT NULL AND MEMBER_ID <> ''"
+    ).fetch_one()[0])
+    if metadata or members:
+        raise RuntimeError("MANUAL INTERVENTION REQUIRED: cluster lookup failed but metadata/GR state exists: %s" % exc)
+    cluster = dba.create_cluster(NAME, {
+        "communicationStack": "MYSQL", "memberSslMode": "REQUIRED",
+        "consistency": "BEFORE_ON_PRIMARY_FAILOVER", "expelTimeout": 10,
+        "autoRejoinTries": 3, "gtidSetIsComplete": True,
+    })
+    print("CLUSTER_CREATED")
+
+topology = cluster.status({"extended": 1})["defaultReplicaSet"]["topology"]
+existing = set(address.rsplit(":", 1)[0] for address in topology)
+for host in MEMBERS[1:]:
+    if host in existing:
+        print("SKIP_ALREADY_MEMBER %s" % host)
+        continue
+    try:
+        cluster.add_instance(connection(host), {
+            "recoveryMethod": "incremental", "recoveryProgress": 2,
+            "localAddress": "%s:{{ mysql_group_replication_port }}" % host,
+        })
+    except Exception as exc:
+        raise RuntimeError("MANUAL INTERVENTION REQUIRED: incremental add of %s failed; no clone attempted: %s" % (host, exc))
+    print("ADDED %s" % host)
+print("FINAL_STATUS=" + json.dumps(cluster.status({"extended": 1}), sort_keys=True))

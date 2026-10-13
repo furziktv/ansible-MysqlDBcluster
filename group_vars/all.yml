@@ -1,0 +1,148 @@
+---
+# ============================================================
+# MySQL Replication + Orchestrator — global variables
+# All versions are pinned. Never use `latest`.
+# ============================================================
+
+# --- Pinned component versions ---
+mysql_version: "8.4.12"
+mysql_image: "container-registry.oracle.com/mysql/community-server:{{ mysql_version }}"
+orchestrator_version: "3.2.6"
+orchestrator_image: "percona/percona-orchestrator:{{ orchestrator_version }}"
+
+# Docker packages are pinned per supported distribution release because
+# Debian and Ubuntu publish differently versioned builds.
+docker_engine_package_versions:
+  Ubuntu:
+    "22": "5:29.8.0-1~ubuntu.22.04~jammy"
+    "24": "5:29.8.0-1~ubuntu.24.04~noble"
+  Debian:
+    "12": "5:29.8.1-1~debian.12~bookworm"
+containerd_package_versions:
+  Ubuntu:
+    "22": "2.3.6-1~ubuntu.22.04~jammy"
+    "24": "2.3.6-1~ubuntu.24.04~noble"
+  Debian:
+    "12": "2.3.6-1~debian.12~bookworm"
+docker_compose_package_versions:
+  Ubuntu:
+    "22": "5.5.1-1~ubuntu.22.04~jammy"
+    "24": "5.5.1-1~ubuntu.24.04~noble"
+  Debian:
+    "12": "5.5.1-1~debian.12~bookworm"
+
+# --- Replication topology ---
+mysql_primary_host: db01
+mysql_replication_user: replicator
+mysql_replication_password: "{{ vault_mysql_replication_password }}"
+mysql_orchestrator_user: orchestrator
+mysql_orchestrator_password: "{{ vault_mysql_monitor_password }}"
+# Failover responsiveness. A 10s replica timeout is a deliberate compromise:
+# much faster than MySQL's 60s default without treating brief LAN jitter as a
+# dead primary. Heartbeats must be shorter than this timeout.
+mysql_replica_net_timeout_seconds: 10
+mysql_replica_heartbeat_period_seconds: 2
+orchestrator_instance_poll_seconds: 2
+orchestrator_mysql_connect_timeout_seconds: 2
+orchestrator_mysql_read_timeout_seconds: 3
+keepalived_probe_interval_seconds: 1
+keepalived_probe_fall_count: 2
+keepalived_probe_rise_count: 1
+orchestrator_http_user: orchestrator-ui
+orchestrator_http_password: "{{ vault_orchestrator_http_password }}"
+# Desired runtime state; deploy re-enables Orchestrator recoveries if an
+# operator or previous maintenance run left the global switch disabled.
+orchestrator_auto_recovery_enabled: true
+mysql_cluster_alias: production-mysql
+orchestrator_raft_port: 10008
+orchestrator_http_port: 3000
+orchestrator_data_dir: /srv/orchestrator/data
+orchestrator_config_dir: /srv/orchestrator/config
+orchestrator_compose_file: /srv/orchestrator/docker-compose.yml
+orchestrator_container_uid: 1001
+orchestrator_container_gid: 1001
+# Explicit one-time gate; never enable in inventory.
+confirm_mysql_replication_bootstrap: "NO"
+
+# --- Networking / ports ---
+mysql_port: 3306
+mysql_x_port: 33060
+keepalived_vrrp_priority_base: 100
+
+# Single client endpoint. MUST be replaced before deploy.
+# The database hosts report 10.100.0.0/16; use an IP from that subnet that is
+# not used/reserved by any host. Preflight checks duplicate use on the LAN.
+mysql_cluster_network_cidr: "10.100.0.0/16"
+mysql_vip: "10.100.0.5"
+mysql_vip_cidr: 16
+mysql_vip_interface: "eth0"
+# Auto-detect interface if eth0 does not exist (see keepalived role).
+mysql_vip_interface_autodetect: true
+
+# Networks allowed to reach MySQL (clients connect to the primary VIP on 3306).
+mysql_trusted_networks:
+  # Controller/application host 10.100.1.1 is on this /24; keep client scope narrow.
+  - "10.100.0.0/16"
+# Do not open SSH globally. Replace this with the controller/admin CIDR(s).
+ssh_trusted_networks:
+  - "10.100.1.0/24"
+cluster_nodes:
+  - "10.100.0.1"
+  - "10.100.0.2"
+  - "10.100.0.3"
+
+# --- Persistent storage (bind mounts, never anonymous volumes) ---
+mysql_data_dir: "/srv/mysql/data"
+mysql_config_dir: "/srv/mysql/config"
+mysql_secrets_dir: "/srv/mysql/secrets"
+mysql_logs_dir: "/srv/mysql/logs"
+mysql_run_dir: "/srv/mysql/run"
+mysql_compose_dir: "/srv/mysql"
+mysql_compose_file: "/srv/mysql/docker-compose.yml"
+mysql_container_name: "mysql"
+# Verified from the pinned Oracle community-server:8.4.12 image.
+mysql_container_uid: 27
+mysql_container_gid: 27
+
+# --- MySQL accounts (passwords live in group_vars/vault.yml) ---
+mysql_root_password: "{{ vault_mysql_root_password }}"
+# This existing Vault value is used as the replication account secret during
+# this topology; the historical variable name remains for vault compatibility.
+mysql_cluster_admin_user: "clusteradmin"
+mysql_cluster_admin_password: "{{ vault_mysql_cluster_admin_password }}"
+mysql_monitor_user: "monitor"
+mysql_monitor_password: "{{ vault_mysql_monitor_password }}"
+mysql_app_user: "appuser"
+mysql_app_password: "{{ vault_mysql_app_password }}"
+mysql_app_database: "appdb"
+mysql_app_account_host: "10.100.1.%"
+mysql_app_cluster_account_host: "10.100.0.%"
+mysql_admin_account_host: "10.100.0.%"
+
+# --- Host requirements (preflight thresholds) ---
+preflight_min_disk_gb: 10
+# Lowered to fit the operators' existing nodes (about 1968 MiB MemTotal).
+# Keep a safety margin; do not lower further without re-evaluating MySQL memory.
+preflight_min_ram_mb: 1900
+preflight_max_clock_skew_seconds: 5
+
+# --- Docker logging ---
+docker_log_max_size: "10m"
+docker_log_max_file: "3"
+
+# --- OS assumptions ---
+supported_distros:
+  - { name: "Ubuntu", min_major: 22 }
+  - { name: "Debian", min_major: 12 }
+
+# --- Safety switches (destroy / reclone) ---
+# Must be passed explicitly on the CLI, never set to YES here.
+confirm_destroy_cluster: "NO"
+confirm_destroy_data: "NO"
+confirm_reclone_instance: "NO"
+recovery_target: ""
+recovery_clone_donor: ""
+
+# Existing non-empty data without this project marker is never adopted
+# implicitly. See the preflight role.
+mysql_managed_marker: "/srv/mysql/.ansible-managed"

@@ -1,0 +1,3 @@
+---
+firewall_allow_ssh: true
+firewall_ssh_port: 22

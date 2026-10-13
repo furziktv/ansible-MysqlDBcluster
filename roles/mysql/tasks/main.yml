@@ -1,0 +1,285 @@
+---
+# mysql role: persistent dirs, secrets (0600), config, compose, launch, health
+- name: MySQL | Inspect datadir path before creating or following it
+  ansible.builtin.stat:
+    path: "{{ mysql_data_dir }}"
+    follow: false
+  register: _mysql_data_path_before
+  tags: [mysql]
+
+- name: MySQL | Refuse symlinked datadir even when preflight tag is skipped
+  ansible.builtin.assert:
+    that: not (_mysql_data_path_before.stat.islnk | default(false))
+    fail_msg: "MANUAL INTERVENTION REQUIRED: {{ mysql_data_dir }} is a symlink; verify storage path before deployment."
+  tags: [mysql]
+
+- name: MySQL | Ensure persistent directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop:
+    # The Oracle MySQL container runs mysqld as mysql_container_uid/gid. The
+    # bind-mounted datadir must be writable by that account on first init and
+    # during initial server initialization and replication setup.
+    - { path: "{{ mysql_data_dir }}", owner: "{{ mysql_container_uid }}", group: "{{ mysql_container_gid }}", mode: "0755" }
+    - { path: "{{ mysql_config_dir }}", mode: "0755" }
+    - { path: "{{ mysql_logs_dir }}", owner: "{{ mysql_container_uid }}", group: "{{ mysql_container_gid }}", mode: "0750" }
+    - { path: "{{ mysql_run_dir }}", owner: "{{ mysql_container_uid }}", group: "{{ mysql_container_gid }}", mode: "0750" }
+  tags: [mysql]
+
+- name: MySQL | Ensure secrets directory is private
+  ansible.builtin.file:
+    path: "{{ mysql_secrets_dir }}"
+    state: directory
+    mode: "0700"
+  tags: [mysql]
+
+- name: MySQL | Inspect existing data dir (never delete)
+  ansible.builtin.find:
+    paths: "{{ mysql_data_dir }}"
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _mysql_data_ls
+  tags: [mysql]
+
+- name: MySQL | Inspect project ownership marker
+  ansible.builtin.stat:
+    path: "{{ mysql_managed_marker }}"
+  register: _mysql_managed_marker_stat
+  tags: [mysql]
+
+- name: MySQL | Refuse to mark unknown existing datadir as managed
+  ansible.builtin.assert:
+    that:
+      - (_mysql_data_ls.matched | int == 0) or _mysql_managed_marker_stat.stat.exists
+    fail_msg: >-
+      MANUAL INTERVENTION REQUIRED: {{ mysql_data_dir }} is non-empty without
+      {{ mysql_managed_marker }}. No ownership marker will be written and no
+      MySQL container will be started against this data.
+  tags: [mysql]
+
+- name: MySQL | Mark verified empty datadir as managed before initialization
+  ansible.builtin.copy:
+    dest: "{{ mysql_managed_marker }}"
+    content: "Managed by this Ansible MySQL cluster project. Created after verifying an empty datadir; preserve data and marker.\n"
+    owner: root
+    group: root
+    mode: "0600"
+  when: not _mysql_managed_marker_stat.stat.exists
+  tags: [mysql]
+
+- name: MySQL | Detect existing data (mysql.ibd / ibdata1 / #innodb_redo)
+  ansible.builtin.stat:
+    path: "{{ mysql_data_dir }}/auto.cnf"
+  register: _mysql_has_data
+  tags: [mysql]
+
+- name: MySQL | Record whether this container already exists before config update
+  ansible.builtin.command: docker inspect {{ mysql_container_name }}
+  register: _mysql_container_before
+  changed_when: false
+  failed_when: false
+  tags: [mysql]
+
+- name: MySQL | Inspect replication ownership marker for guarded bootstrap repair
+  ansible.builtin.stat:
+    path: "/srv/mysql/{{ 'replication-seed-ready' if inventory_hostname == mysql_primary_host else 'replication-replica-ready' }}"
+  register: _mysql_replication_marker
+  tags: [mysql]
+
+- name: MySQL | Predict root-secret rotation without writing secret files
+  ansible.builtin.copy:
+    dest: "{{ mysql_secrets_dir }}/mysql_root_password"
+    content: "{{ mysql_root_password }}\n"
+    mode: "0600"
+  check_mode: true
+  register: _mysql_root_secret_candidate
+  when: _mysql_container_before.rc == 0
+  no_log: true
+  tags: [mysql]
+
+- name: MySQL | Predict application-secret rotation without writing secret files
+  ansible.builtin.copy:
+    dest: "{{ mysql_secrets_dir }}/mysql_app_password"
+    content: "{{ mysql_app_password }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  check_mode: true
+  register: _mysql_app_secret_candidate
+  when: _mysql_container_before.rc == 0
+  no_log: true
+  tags: [mysql]
+
+- name: MySQL | Predict monitoring-secret rotation without writing secret files
+  ansible.builtin.copy:
+    dest: "{{ mysql_secrets_dir }}/mysql_monitor_password"
+    content: "{{ mysql_monitor_password }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  check_mode: true
+  register: _mysql_monitor_secret_candidate
+  when: _mysql_container_before.rc == 0
+  no_log: true
+  tags: [mysql]
+
+- name: MySQL | Refuse credential rotation through ordinary deploy
+  ansible.builtin.assert:
+    that:
+      - not (_mysql_root_secret_candidate.changed | default(false))
+      - not (_mysql_app_secret_candidate.changed | default(false))
+      - not (_mysql_monitor_secret_candidate.changed | default(false))
+    fail_msg: >-
+      REFUSING to change generated root/application/monitor secret files on an
+      existing instance. The Oracle image's MYSQL_ROOT_PASSWORD initialization
+      variable is ignored for an initialized datadir, and MySQL accounts are
+      not rotated implicitly.
+      Use a separately reviewed account-rotation procedure.
+  when: _mysql_container_before.rc == 0
+  tags: [mysql]
+
+- name: MySQL | Predict changes to MySQL config on an existing instance
+  ansible.builtin.template:
+    src: my.cnf.j2
+    dest: "{{ mysql_config_dir }}/my.cnf"
+    mode: "0644"
+  check_mode: true
+  register: _mysql_candidate_config
+  when: _mysql_container_before.rc == 0
+  tags: [mysql]
+
+- name: MySQL | Predict changes to Compose definition on an existing instance
+  ansible.builtin.template:
+    src: docker-compose.full.yml.j2
+    dest: "{{ mysql_compose_file }}"
+    mode: "0644"
+  check_mode: true
+  register: _mysql_candidate_compose
+  when: _mysql_container_before.rc == 0
+  tags: [mysql]
+
+- name: MySQL | Refuse uncoordinated MySQL config/image changes during deploy
+  ansible.builtin.assert:
+    that:
+      - not (_mysql_candidate_compose.changed | default(false))
+      - >-
+        not (_mysql_candidate_config.changed | default(false)) or
+        (confirm_mysql_replication_bootstrap == 'YES_INITIALIZE_ASYNC_REPLICATION'
+         and not _mysql_replication_marker.stat.exists)
+    fail_msg: >-
+      REFUSING an uncoordinated restart of an existing MySQL instance. A config,
+      image, or Compose change was detected. Only the explicitly confirmed,
+      marker-free first replication bootstrap may apply a MySQL config-only
+      repair. Compose/image changes still require a separately reviewed
+      maintenance procedure.
+  when: _mysql_container_before.rc == 0
+  tags: [mysql]
+
+- name: MySQL | Write root password secret file (0600)
+  ansible.builtin.copy:
+    dest: "{{ mysql_secrets_dir }}/mysql_root_password"
+    content: "{{ mysql_root_password }}\n"
+    mode: "0600"
+  no_log: true
+  tags: [mysql]
+
+- name: MySQL | Write application healthcheck credential file (0600)
+  ansible.builtin.copy:
+    dest: "{{ mysql_secrets_dir }}/mysql_app_password"
+    content: "{{ mysql_app_password }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  tags: [mysql]
+
+- name: MySQL | Write monitoring credential file for future exporter integration (0600)
+  ansible.builtin.copy:
+    dest: "{{ mysql_secrets_dir }}/mysql_monitor_password"
+    content: "{{ mysql_monitor_password }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  tags: [mysql]
+
+- name: MySQL | Render my.cnf for this node
+  ansible.builtin.template:
+    src: my.cnf.j2
+    dest: "{{ mysql_config_dir }}/my.cnf"
+    mode: "0644"
+  tags: [mysql]
+  register: _mysql_config_result
+
+- name: MySQL | Render MySQL replication Compose file
+  ansible.builtin.template:
+    src: docker-compose.full.yml.j2
+    dest: "{{ mysql_compose_file }}"
+    mode: "0644"
+  tags: [mysql]
+
+- name: MySQL | Pull MySQL image (pinned version)
+  community.docker.docker_image:
+    name: "{{ mysql_image }}"
+    source: pull
+  tags: [mysql]
+
+- name: MySQL | Verify pinned Server version inside image
+  ansible.builtin.command:
+    argv: [docker, run, --rm, --entrypoint, mysqld, "{{ mysql_image }}", --version]
+  register: _mysql_image_version
+  changed_when: false
+  failed_when: _mysql_image_version.rc != 0 or mysql_version not in _mysql_image_version.stdout
+  tags: [mysql]
+
+- name: MySQL | Start MySQL container via compose
+  community.docker.docker_compose_v2:
+    project_src: "{{ mysql_compose_dir }}"
+    state: present
+    pull: missing
+  tags: [mysql]
+
+- name: MySQL | Wait for MySQL port
+  ansible.builtin.wait_for:
+    host: "{{ node_ip }}"
+    port: "{{ mysql_port }}"
+    timeout: 180
+  tags: [mysql]
+
+- name: MySQL | Wait for healthy container
+  ansible.builtin.command: >-
+    docker inspect --format={% raw %}'{{.State.Health.Status}}'{% endraw %} {{ mysql_container_name }}
+  register: _mysql_health
+  until: _mysql_health.stdout is search("healthy")
+  retries: 30
+  delay: 10
+  changed_when: false
+  failed_when: _mysql_health.rc != 0 or _mysql_health.stdout | trim != 'healthy'
+  tags: [mysql]
+
+- name: MySQL | Restart pre-existing instance after MySQL configuration changed
+  community.docker.docker_container:
+    name: "{{ mysql_container_name }}"
+    state: started
+    restart: true
+  when:
+    - _mysql_container_before.rc == 0
+    - _mysql_config_result.changed | default(false)
+  register: _mysql_config_restart
+  tags: [mysql]
+
+- name: MySQL | Wait for restarted instance to become healthy
+  ansible.builtin.command: >-
+    docker inspect --format={% raw %}'{{.State.Health.Status}}'{% endraw %} {{ mysql_container_name }}
+  register: _mysql_restart_health
+  until: _mysql_restart_health.stdout | trim == 'healthy'
+  retries: 30
+  delay: 10
+  changed_when: false
+  when: _mysql_config_restart is changed
+  tags: [mysql]

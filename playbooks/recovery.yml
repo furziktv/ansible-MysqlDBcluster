@@ -1,0 +1,65 @@
+---
+# Recovery actions are intentionally not inferred. Orchestrator performs
+# configured automatic replica promotion; this playbook reports state only.
+- name: Diagnose MySQL replication and Orchestrator state without changing it
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Recovery | Read local replica status
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "MYSQL_PWD={{ mysql_root_password }}"
+          - "{{ mysql_container_name }}"
+          - mysql
+          - --protocol=socket
+          - --socket=/var/run/mysqld/mysqld.sock
+          - -uroot
+          - -NBe
+          - "SHOW REPLICA STATUS"
+      register: _recovery_replica
+      changed_when: false
+      failed_when: false
+      no_log: true
+      tags: [recovery]
+
+    - name: Recovery | Query Orchestrator observed topology
+      ansible.builtin.uri:
+        url: "http://{{ node_ip }}:{{ orchestrator_http_port }}/api/cluster/alias/{{ mysql_cluster_alias }}"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _recovery_topology
+      failed_when: false
+      no_log: true
+      tags: [recovery]
+
+    - name: Recovery | Report state, not a guessed repair
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} replica status={{ _recovery_replica.stdout | default('UNAVAILABLE') }};
+          Orchestrator topology={{ _recovery_topology.json | default('UNAVAILABLE') }}.
+          No data was reset, cloned, or reparented.
+      tags: [recovery]
+
+- name: Explain operator gate for any recovery action
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Recovery | Require diagnosis before manual intervention
+      ansible.builtin.debug:
+        msg: >-
+          This playbook is read-only. If Orchestrator has not completed a safe
+          promotion, stop here and inspect its topology, recovery log, GTID sets,
+          and the writable status of every node before choosing any failover,
+          reparent, or reclone action. Never force a second writable primary.
+      tags: [recovery]

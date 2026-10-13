@@ -1,0 +1,30 @@
+# MySQL replication node. Clients use the Keepalived VIP on TCP 3306.
+name: mysql-replication
+services:
+  mysql:
+    image: {{ mysql_image }}
+    container_name: {{ mysql_container_name }}
+    network_mode: host
+    restart: unless-stopped
+    command: ["--defaults-file=/etc/mysql/conf.d/my.cnf"]
+    environment:
+      # Oracle's community-server image accepts the mounted secret's path in
+      # MYSQL_ROOT_PASSWORD; the *_FILE convention belongs to other images.
+      MYSQL_ROOT_PASSWORD: /run/secrets/mysql_root_password
+    volumes:
+      - {{ mysql_data_dir }}:/var/lib/mysql
+      - {{ mysql_config_dir }}/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+      - {{ mysql_logs_dir }}:/var/log/mysql
+      - {{ mysql_run_dir }}:/var/run/mysqld
+      - {{ mysql_secrets_dir }}/mysql_root_password:/run/secrets/mysql_root_password:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "{{ docker_log_max_size }}"
+        max-file: "{{ docker_log_max_file }}"

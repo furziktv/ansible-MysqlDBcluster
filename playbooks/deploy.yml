@@ -1,0 +1,196 @@
+---
+- name: Run cluster-wide safety preflight
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - { role: preflight, tags: [preflight] }
+
+- name: Host prerequisites and serialized MySQL convergence
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - { role: common, tags: [common] }
+    - { role: docker, tags: [docker] }
+    - { role: firewall, tags: [firewall] }
+    - { role: mysql, tags: [mysql] }
+
+- name: Initialize GTID asynchronous replication topology
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - { role: mysql_replication, tags: [replication] }
+
+- name: Start Orchestrator Raft members and discover replication topology
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - { role: orchestrator, tags: [orchestrator] }
+  post_tasks:
+    - name: Orchestrator | Discover the configured primary after all Raft members start
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - >-
+            ORCHESTRATOR_API=http://{{ cluster_nodes | join(':' ~ (orchestrator_http_port | string) ~ '/api http://') }}:{{ orchestrator_http_port }}/api
+          - orchestrator
+          - /usr/bin/orchestrator-client
+          - -auth
+          - "{{ orchestrator_http_user }}:{{ orchestrator_http_password }}"
+          - -c
+          - discover
+          - -i
+          - "{{ hostvars[mysql_primary_host].node_ip }}:{{ mysql_port }}"
+      delegate_to: "{{ groups['mysql_cluster'][0] }}"
+      when: inventory_hostname == groups['mysql_cluster'][-1]
+      changed_when: false
+      failed_when: false
+      register: _orchestrator_discovery
+      no_log: true
+      tags: [orchestrator]
+    - name: Orchestrator | Require topology discovery to succeed
+      ansible.builtin.assert:
+        that: _orchestrator_discovery.rc == 0
+        fail_msg: >-
+          Orchestrator API discovery failed (rc={{ _orchestrator_discovery.rc }}):
+          {{ (_orchestrator_discovery.stderr | default('no error text') | trim)
+             | regex_replace(orchestrator_http_password, '[REDACTED]') }}
+      delegate_to: "{{ groups['mysql_cluster'][0] }}"
+      when: inventory_hostname == groups['mysql_cluster'][-1]
+      tags: [orchestrator]
+
+    - name: Orchestrator | Wait until the discovered alias is visible through the Raft API
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[groups['mysql_cluster'][0]].node_ip }}:{{ orchestrator_http_port }}/api/cluster/alias/{{ mysql_cluster_alias }}"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: [200, 500]
+      register: _orchestrator_discovered_topology
+      until: _orchestrator_discovered_topology.status | default(0) == 200
+      retries: 24
+      delay: 5
+      failed_when: false
+      no_log: true
+      delegate_to: "{{ groups['mysql_cluster'][0] }}"
+      when: inventory_hostname == groups['mysql_cluster'][-1]
+      tags: [orchestrator]
+
+    - name: Orchestrator | Require all instances and exactly one writable primary in discovered topology
+      ansible.builtin.assert:
+        that:
+          - _orchestrator_discovered_topology.status | default(0) == 200
+          - _orchestrator_discovered_topology.json | length == groups['mysql_cluster'] | length
+          - >-
+            (_orchestrator_discovered_topology.json
+             | selectattr('ReplicationDepth', 'equalto', 0)
+             | selectattr('ReadOnly', 'equalto', false)
+             | list | length) == 1
+        fail_msg: >-
+          Orchestrator discovery did not converge to all expected nodes with
+          exactly one writable primary. Refusing to treat deployment as ready;
+          inspect Orchestrator Raft, MySQL topology credentials, and replication
+          state before exposing the VIP.
+      delegate_to: "{{ groups['mysql_cluster'][0] }}"
+      when: inventory_hostname == groups['mysql_cluster'][-1]
+      no_log: true
+      tags: [orchestrator]
+
+    - name: Orchestrator | Read global automatic recovery switch
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[groups['mysql_cluster'][0]].node_ip }}:{{ orchestrator_http_port }}/api/check-global-recoveries"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _orchestrator_global_recoveries
+      no_log: true
+      delegate_to: "{{ groups['mysql_cluster'][0] }}"
+      when:
+        - inventory_hostname == groups['mysql_cluster'][-1]
+        - orchestrator_auto_recovery_enabled | bool
+      tags: [orchestrator]
+
+    - name: Orchestrator | Enable automatic failover when its global switch is disabled
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[groups['mysql_cluster'][0]].node_ip }}:{{ orchestrator_http_port }}/api/enable-global-recoveries"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        method: GET
+        return_content: true
+        status_code: 200
+      register: _orchestrator_enable_recoveries
+      changed_when: true
+      no_log: true
+      delegate_to: "{{ groups['mysql_cluster'][0] }}"
+      when:
+        - inventory_hostname == groups['mysql_cluster'][-1]
+        - orchestrator_auto_recovery_enabled | bool
+        - _orchestrator_global_recoveries.json.Details | default('disabled') != 'enabled'
+      tags: [orchestrator]
+
+    - name: Orchestrator | Confirm automatic failover is enabled
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[groups['mysql_cluster'][0]].node_ip }}:{{ orchestrator_http_port }}/api/check-global-recoveries"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _orchestrator_recoveries_confirmed
+      no_log: true
+      delegate_to: "{{ groups['mysql_cluster'][0] }}"
+      when:
+        - inventory_hostname == groups['mysql_cluster'][-1]
+        - orchestrator_auto_recovery_enabled | bool
+      tags: [orchestrator]
+
+    - name: Orchestrator | Refuse deployment if automatic failover remains disabled
+      ansible.builtin.assert:
+        that: _orchestrator_recoveries_confirmed.json.Details | default('disabled') == 'enabled'
+        fail_msg: "Orchestrator global automatic recoveries are disabled."
+      no_log: true
+      delegate_to: "{{ groups['mysql_cluster'][0] }}"
+      when:
+        - inventory_hostname == groups['mysql_cluster'][-1]
+        - orchestrator_auto_recovery_enabled | bool
+      tags: [orchestrator]
+
+- name: Enable floating VIP only after replication and Orchestrator are running
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - { role: keepalived, tags: [keepalived] }
+    - { role: monitoring, tags: [monitoring] }

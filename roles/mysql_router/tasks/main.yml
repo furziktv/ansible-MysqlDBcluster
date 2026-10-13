@@ -1,0 +1,154 @@
+---
+- name: Router | Pull pinned image before resolving runtime user
+  community.docker.docker_image:
+    name: "{{ mysql_router_image }}"
+    source: pull
+  tags: [router]
+
+- name: Router | Verify pinned Router version inside image
+  ansible.builtin.command:
+    argv: [docker, run, --rm, --entrypoint, mysqlrouter, "{{ mysql_router_image }}", --version]
+  register: _router_image_version
+  changed_when: false
+  failed_when: _router_image_version.rc != 0 or mysql_router_version not in _router_image_version.stdout
+  tags: [router]
+
+- name: Router | Resolve UID and GID for the image's mysqlrouter account
+  ansible.builtin.command:
+    argv: [docker, run, --rm, --entrypoint, /usr/bin/id, "{{ mysql_router_image }}", -u, mysqlrouter]
+  register: _router_uid
+  changed_when: false
+  tags: [router]
+
+- name: Router | Resolve GID for the image's mysqlrouter account
+  ansible.builtin.command:
+    argv: [docker, run, --rm, --entrypoint, /usr/bin/id, "{{ mysql_router_image }}", -g, mysqlrouter]
+  register: _router_gid
+  changed_when: false
+  tags: [router]
+
+- name: Router | Validate image runtime identity
+  ansible.builtin.assert:
+    that:
+      - _router_uid.stdout | trim is match('^[0-9]+$')
+      - _router_gid.stdout | trim is match('^[0-9]+$')
+    fail_msg: "MANUAL INTERVENTION REQUIRED: could not resolve mysqlrouter runtime UID/GID from the pinned image."
+  tags: [router]
+
+- name: Router | Ensure persistent Router directory is writable by its runtime user
+  ansible.builtin.file:
+    path: "{{ mysql_router_dir }}"
+    state: directory
+    owner: "{{ _router_uid.stdout | trim }}"
+    group: "{{ _router_gid.stdout | trim }}"
+    mode: "0750"
+  tags: [router]
+
+- name: Router | Check for an existing Router configuration
+  ansible.builtin.stat:
+    path: "{{ mysql_router_dir }}/mysqlrouter.conf"
+  register: _router_config
+  tags: [router]
+
+- name: Router | Refuse partial or unknown existing Router state
+  ansible.builtin.find:
+    paths: "{{ mysql_router_dir }}"
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _router_files
+  when: not _router_config.stat.exists
+  tags: [router]
+
+- name: Router | Require manual review for partial Router state
+  ansible.builtin.assert:
+    that: _router_files.matched | int == 0
+    fail_msg: >-
+      MANUAL INTERVENTION REQUIRED: {{ mysql_router_dir }} contains files but no
+      mysqlrouter.conf. Preserve and inspect this state before bootstrapping.
+  when: not _router_config.stat.exists
+  tags: [router]
+
+- name: Router | Bootstrap the local Router once from cluster metadata
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - -d
+      - --name
+      - mysql-router-bootstrap
+      - --network
+      - host
+      - -e
+      - "MYSQL_HOST={{ node_ip }}"
+      - -e
+      - "MYSQL_PORT={{ mysql_port }}"
+      - -e
+      - "MYSQL_USER={{ mysql_cluster_admin_user }}"
+      - -e
+      - "MYSQL_PASSWORD={{ mysql_cluster_admin_password }}"
+      - -e
+      - MYSQL_INNODB_CLUSTER_MEMBERS=3
+      - -e
+      - "MYSQL_ROUTER_BOOTSTRAP_EXTRA_OPTIONS=--directory=/var/lib/mysqlrouter,--conf-base-port={{ mysql_router_write_port }},--account-host=10.100.0.%"
+      - -v
+      - "{{ mysql_router_dir }}:/var/lib/mysqlrouter"
+      - "{{ mysql_router_image }}"
+  register: _router_bootstrap_container
+  when: not _router_config.stat.exists
+  no_log: true
+  tags: [router]
+
+- name: Router | Wait for generated configuration
+  ansible.builtin.wait_for:
+    path: "{{ mysql_router_dir }}/mysqlrouter.conf"
+    state: present
+    timeout: 180
+  when: not _router_config.stat.exists
+  tags: [router]
+
+- name: Router | Stop bootstrap process after persistent config has been written
+  ansible.builtin.command:
+    argv: [docker, rm, --force, mysql-router-bootstrap]
+  register: _router_bootstrap_cleanup
+  changed_when: _router_bootstrap_cleanup.rc == 0
+  when: not _router_config.stat.exists
+  no_log: true
+  tags: [router]
+
+- name: Router | Start configured Router profile
+  ansible.builtin.command:
+    argv: [docker, compose, --profile, router, -f, "{{ mysql_compose_file }}", up, -d, mysql-router]
+  register: _router_up
+  changed_when: "'Started' in _router_up.stdout or 'Created' in _router_up.stdout or 'Recreated' in _router_up.stdout"
+  tags: [router]
+
+- name: Router | Wait for Router write and read ports
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ item }}"
+    timeout: 180
+  loop:
+    - "{{ mysql_router_write_port }}"
+    - "{{ mysql_router_read_port }}"
+  tags: [router]
+
+- name: Router | Verify write route reaches MySQL through Router
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "MYSQL_PWD={{ mysql_app_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - -h127.0.0.1
+      - "-P{{ mysql_router_write_port }}"
+      - "-u{{ mysql_app_user }}"
+      - -NBe
+      - "SELECT @@global.read_only"
+  register: _router_write_probe
+  changed_when: false
+  failed_when: _router_write_probe.rc != 0 or _router_write_probe.stdout | trim != '0'
+  no_log: true
+  tags: [router]

@@ -1,0 +1,91 @@
+---
+# Destroy: two independent confirmations. Data is NEVER removed without
+# confirm_destroy_data="YES_DELETE_MYSQL_DATA".
+# Stop only: -e confirm_destroy_cluster="YES_I_WANT_TO_DESTROY_MYSQL_CLUSTER"
+# + data:    ... -e confirm_destroy_data="YES_DELETE_MYSQL_DATA"
+- name: Stop MySQL replication and Orchestrator (data preserved by default)
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Destroy | Require explicit cluster confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_destroy_cluster == "YES_I_WANT_TO_DESTROY_MYSQL_CLUSTER"
+        fail_msg: >-
+          REFUSED: pass -e confirm_destroy_cluster="YES_I_WANT_TO_DESTROY_MYSQL_CLUSTER" to stop the cluster.
+      tags: [destroy]
+
+    - name: Destroy | Stop keepalived (drop VIP first)
+      ansible.builtin.systemd:
+        name: keepalived
+        state: stopped
+      tags: [destroy]
+
+    - name: Destroy | Stop compose services (containers only, volumes/bind-mounts untouched)
+      ansible.builtin.command:
+        argv: [docker, compose, -f, "{{ mysql_compose_file }}", stop]
+      register: _destroy_stop
+      changed_when: "'Stopped' in _destroy_stop.stdout"
+      tags: [destroy]
+
+    - name: Destroy | Stop local Orchestrator (state directory preserved)
+      ansible.builtin.command:
+        argv: [docker, compose, -f, "{{ orchestrator_compose_file }}", stop]
+      register: _destroy_orchestrator
+      changed_when: "'Stopped' in _destroy_orchestrator.stdout"
+      failed_when: false
+      tags: [destroy]
+
+    - name: Destroy | Validate optional data deletion confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_destroy_data in ['NO', 'YES_DELETE_MYSQL_DATA']
+        fail_msg: >-
+          REFUSED: data removal requires the exact value YES_DELETE_MYSQL_DATA.
+      tags: [destroy]
+
+    - name: Destroy | Inspect exact persistent data path before deletion
+      ansible.builtin.stat:
+        path: "{{ mysql_data_dir }}"
+        follow: false
+      register: _destroy_data_path
+      when: confirm_destroy_data == "YES_DELETE_MYSQL_DATA"
+      tags: [destroy]
+
+    - name: Destroy | Refuse unexpected data deletion target
+      ansible.builtin.assert:
+        that:
+          - mysql_data_dir == '/srv/mysql/data'
+          - not (_destroy_data_path.stat.islnk | default(false))
+        fail_msg: "REFUSED: data deletion is limited to the literal non-symlink path /srv/mysql/data."
+      when: confirm_destroy_data == "YES_DELETE_MYSQL_DATA"
+      tags: [destroy]
+
+    - name: Destroy | Delete MySQL data (ONLY with second confirmation)
+      ansible.builtin.file:
+        path: "{{ mysql_data_dir }}"
+        state: absent
+      when: confirm_destroy_data == "YES_DELETE_MYSQL_DATA"
+      tags: [destroy]
+
+    - name: Destroy | Remove only replication topology markers after confirmed datadir deletion
+      ansible.builtin.file:
+        path: "/srv/mysql/{{ item }}"
+        state: absent
+      loop:
+        - replication-seed-ready
+        - replication-replica-ready
+      when: confirm_destroy_data == "YES_DELETE_MYSQL_DATA"
+      tags: [destroy]
+
+    - name: Destroy | Final reminder
+      ansible.builtin.debug:
+        msg: >-
+          Destroy complete. Containers stopped.
+          Data dir {{ mysql_data_dir }}: {{ 'DELETED (confirmed)' if confirm_destroy_data == 'YES_DELETE_MYSQL_DATA' else 'PRESERVED' }}.
+          No `down -v` / `volume prune` was executed.
+      tags: [destroy]

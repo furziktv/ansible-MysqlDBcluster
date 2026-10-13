@@ -1,0 +1,2 @@
+---
+# MySQL restarts are explicitly serialized by the deployment/update playbooks.

@@ -1,0 +1,62 @@
+import json
+import sys
+
+USER = "{{ mysql_cluster_admin_user }}"
+PASSWORD = """{{ mysql_cluster_admin_password }}"""
+PORT = {{ mysql_port }}
+TARGET = "{{ hostvars[recovery_target].node_ip }}"
+DONOR = "{{ hostvars[recovery_clone_donor].node_ip if recovery_clone_donor | length > 0 else '' }}"
+CLUSTER_NAME = "{{ mysql_cluster_name }}"
+CLONE_CONFIRMED = {{ 'True' if confirm_reclone_instance == 'YES_RECLONE_INSTANCE' else 'False' }}
+SEEDS = {{ cluster_nodes | to_json }}
+
+cluster = None
+seed = None
+last_error = None
+for address in SEEDS:
+    try:
+        shell.connect({"scheme": "mysql", "host": address, "port": PORT,
+                       "user": USER, "password": PASSWORD})
+        candidate = dba.get_cluster(CLUSTER_NAME)
+        status = candidate.status()
+        topology = status.get("defaultReplicaSet", {}).get("topology", {})
+        online = [entry for entry in topology.values() if entry.get("status") == "ONLINE"]
+        primaries = [entry for entry in online if entry.get("memberRole") == "PRIMARY"]
+        if len(online) < 2 or len(primaries) != 1:
+            raise RuntimeError("MANUAL INTERVENTION REQUIRED: cluster view lacks quorum or exactly one PRIMARY")
+        cluster, seed = candidate, address
+        break
+    except Exception as exc:
+        last_error = exc
+
+if cluster is None:
+    raise RuntimeError("MANUAL INTERVENTION REQUIRED: no safe cluster seed available: %s" % last_error)
+
+topology = cluster.status({"extended": 1}).get("defaultReplicaSet", {}).get("topology", {})
+target_address = TARGET + ":" + str(PORT)
+target_info = topology.get(target_address)
+if not target_info:
+    raise RuntimeError("MANUAL INTERVENTION REQUIRED: target is not a known cluster member; do not auto-add or initialize it")
+if target_info.get("status") == "ONLINE":
+    print("TARGET_ALREADY_ONLINE=%s" % target_address)
+    sys.exit(0)
+if target_info.get("status") not in ("OFFLINE", "ERROR", "MISSING"):
+    raise RuntimeError("MANUAL INTERVENTION REQUIRED: target has unexpected status %s" % target_info.get("status"))
+
+if CLONE_CONFIRMED:
+    if not DONOR:
+        raise RuntimeError("MANUAL INTERVENTION REQUIRED: clone requires an explicitly selected donor")
+    donor_session = mysql.get_session({"scheme": "mysql", "host": DONOR, "port": PORT,
+                                       "user": USER, "password": PASSWORD})
+    donor_info = topology.get(DONOR + ":" + str(PORT))
+    if not donor_info or donor_info.get("status") != "ONLINE":
+        raise RuntimeError("MANUAL INTERVENTION REQUIRED: explicitly selected donor is not ONLINE in the verified cluster topology")
+    donor_state = donor_session.run_sql("SELECT @@GLOBAL.gtid_executed").fetch_one()[0]
+    if not donor_state:
+        raise RuntimeError("MANUAL INTERVENTION REQUIRED: selected donor has no readable GTID state")
+    cluster.rejoin_instance("%s:%s" % (TARGET, PORT), {
+        "recoveryMethod": "clone", "cloneDonor": "%s:%s" % (DONOR, PORT)})
+    print("CLONE_STARTED target=%s donor=%s seed=%s" % (TARGET, DONOR, seed))
+else:
+    cluster.rejoin_instance("%s:%s" % (TARGET, PORT), {"recoveryMethod": "incremental"})
+    print("REJOINED target=%s seed=%s" % (TARGET, seed))

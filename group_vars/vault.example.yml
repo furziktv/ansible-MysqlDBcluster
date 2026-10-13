@@ -1,0 +1,17 @@
+---
+# ============================================================
+# EXAMPLE vault file — copy to vault.yml and encrypt:
+#   cp group_vars/vault.example.yml group_vars/vault.yml
+#   ansible-vault encrypt group_vars/vault.yml
+# Then replace every CHANGEME_* value with a strong generated password:
+#   openssl rand -base64 24
+# NEVER commit the real vault.yml with real passwords unencrypted.
+# NEVER reuse the SSH password of user `furzik` here.
+# ============================================================
+vault_mysql_root_password: "o8LWL9tokt8OoNjifWNYVS2fpZbB8CNB"
+vault_mysql_cluster_admin_password: "pXfSlRmOGK3WU926hOv3lIMOefPxpO7p"
+vault_mysql_replication_password: "R3placeWithUniqueRandomReplicationSecret"
+vault_orchestrator_http_password: "R3placeWithUniqueRandomOrchestratorSecret"
+vault_mysql_monitor_password: "IlaLH1PiNjdD9CqBWQ1dGW5Ssppw88ld"
+vault_mysql_app_password: "dj9HbV4l4Snqo5kcSJlAkRT4fozgcwjo"
+vault_keepalived_auth_pass: "FtWU3haq"

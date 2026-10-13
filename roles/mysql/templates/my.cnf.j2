@@ -1,0 +1,63 @@
+# MySQL 8.4 LTS — GTID asynchronous replication configuration.
+# Managed by Ansible. Changes require container recreation.
+[mysqld]
+# The Oracle MySQL container's mounted option-file examples require this
+# explicit service account. Without it, startup can fail to initialize the
+# system schema correctly on a fresh bind-mounted datadir.
+user = mysql
+# --- Identity ---
+server_id = {{ mysql_server_id }}
+report_host = {{ node_ip }}
+datadir = /var/lib/mysql
+socket = /var/run/mysqld/mysqld.sock
+pid-file = /var/run/mysqld/mysqld.pid
+bind-address = 0.0.0.0
+# X Protocol is not used by this design.
+# Keep it loopback-only rather than exposing an unused listener on the LAN.
+mysqlx-bind-address = 127.0.0.1
+port = {{ mysql_port }}
+mysqlx-port = {{ mysql_x_port }}
+
+# --- InnoDB / durability (production-oriented) ---
+innodb_buffer_pool_size = 512M
+innodb_redo_log_capacity = 536870912
+innodb_flush_log_at_trx_commit = 1
+sync_binlog = 1
+innodb_flush_method = O_DIRECT
+
+# --- GTID replication ---
+gtid_mode = ON
+enforce_gtid_consistency = ON
+
+# --- Binary logging ---
+log_bin = mysql-bin
+binlog_format = ROW
+log_replica_updates = ON
+binlog_expire_logs_seconds = 604800
+
+# --- Replication infra ---
+replica_parallel_workers = 4
+replica_preserve_commit_order = ON
+relay_log_recovery = ON
+
+# Do not set read_only/super_read_only here: the Oracle image must be able to
+# write its initialization SQL on a fresh datadir. The replication role applies
+# persisted read-only defaults after initialization and fences replicas.
+
+# --- Character set ---
+character-set-server = utf8mb4
+collation-server = utf8mb4_0900_ai_ci
+
+# --- Logging ---
+log_error = /var/log/mysql/error.log
+slow_query_log = 1
+slow_query_log_file = /var/log/mysql/slow.log
+long_query_time = 2
+
+# --- Misc safety ---
+max_connections = 500
+skip-name-resolve
+
+[client]
+port = {{ mysql_port }}
+socket = /var/run/mysqld/mysqld.sock

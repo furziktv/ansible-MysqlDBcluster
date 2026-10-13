@@ -1,0 +1,202 @@
+---
+- name: Read-only MySQL async replication and Orchestrator health report
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Health | Inspect MySQL container
+      ansible.builtin.command:
+        argv: [docker, inspect, --format, "{{'{{'}}.State.Status{{'}}'}}|{{'{{'}}.State.Health.Status{{'}}'}}|{{'{{'}}.RestartCount{{'}}'}}", "{{ mysql_container_name }}"]
+      register: _hc_mysql_container
+      changed_when: false
+      failed_when: false
+      tags: [healthcheck]
+
+    - name: Health | Read local server and replication status
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "MYSQL_PWD={{ mysql_root_password }}"
+          - "{{ mysql_container_name }}"
+          - mysql
+          - --protocol=socket
+          - --socket=/var/run/mysqld/mysqld.sock
+          - -uroot
+          - -NBe
+          - >-
+            SELECT CONCAT('id=',@@server_id,' uuid=',@@server_uuid,' read_only=',@@read_only,' super_read_only=',@@super_read_only,
+              ' gtid_executed=',@@global.gtid_executed);
+            SELECT CONCAT('source=',COALESCE((SELECT HOST FROM performance_schema.replication_connection_configuration LIMIT 1),'none'),
+              ' io=',COALESCE((SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1),'none'),
+              ' sql=',COALESCE((SELECT SERVICE_STATE FROM performance_schema.replication_applier_status LIMIT 1),'none'));
+      register: _hc_mysql
+      changed_when: false
+      failed_when: false
+      no_log: true
+      tags: [healthcheck]
+
+    - name: Health | Verify Orchestrator topology account can read SHOW REPLICAS
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "MYSQL_PWD={{ mysql_orchestrator_password }}"
+          - "{{ mysql_container_name }}"
+          - mysql
+          - "-h{{ item }}"
+          - -u{{ mysql_orchestrator_user }}
+          - -NBe
+          - "SELECT CONCAT('connection=', USER(), ' matched=', CURRENT_USER()); SHOW REPLICAS"
+      register: _hc_orchestrator_mysql
+      loop: "{{ cluster_nodes }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+      no_log: true
+      tags: [healthcheck]
+
+    - name: Health | Read local Orchestrator API topology
+      ansible.builtin.uri:
+        url: "http://{{ node_ip }}:{{ orchestrator_http_port }}/api/cluster/alias/{{ mysql_cluster_alias }}"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _hc_orchestrator
+      failed_when: false
+      no_log: true
+      tags: [healthcheck]
+
+    - name: Health | Read Orchestrator discovered clusters and primary instance
+      ansible.builtin.uri:
+        url: "http://{{ node_ip }}:{{ orchestrator_http_port }}/api/clusters"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _hc_orchestrator_clusters
+      failed_when: false
+      no_log: true
+      tags: [healthcheck]
+
+    - name: Health | Read Orchestrator failure analysis
+      ansible.builtin.uri:
+        url: "http://{{ node_ip }}:{{ orchestrator_http_port }}/api/problems/{{ hostvars[mysql_primary_host].node_ip }}:{{ mysql_port }}"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: [200, 500]
+      register: _hc_orchestrator_analysis
+      failed_when: false
+      no_log: true
+      tags: [healthcheck]
+
+    - name: Health | Read Orchestrator instance eligibility details
+      ansible.builtin.uri:
+        url: "http://{{ node_ip }}:{{ orchestrator_http_port }}/api/instance/{{ item }}/{{ mysql_port }}"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: [200, 404, 500]
+      loop: "{{ cluster_nodes }}"
+      register: _hc_orchestrator_instances
+      failed_when: false
+      no_log: true
+      tags: [healthcheck]
+
+    - name: Health | Read Orchestrator cluster recovery settings
+      ansible.builtin.uri:
+        url: "http://{{ node_ip }}:{{ orchestrator_http_port }}/api/cluster-info/{{ mysql_cluster_alias }}"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: [200, 404, 500]
+      register: _hc_orchestrator_cluster_info
+      failed_when: false
+      no_log: true
+      tags: [healthcheck]
+
+    - name: Health | Check Orchestrator automatic recovery state and audit
+      ansible.builtin.uri:
+        url: "http://{{ node_ip }}:{{ orchestrator_http_port }}{{ item }}"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: [200, 404, 500]
+      loop:
+        - /api/check-global-recoveries
+        - "/api/audit-failure-detection/alias/{{ mysql_cluster_alias }}"
+        - "/api/audit-recovery/alias/{{ mysql_cluster_alias }}"
+      register: _hc_orchestrator_audit
+      failed_when: false
+      no_log: true
+      tags: [healthcheck]
+
+    - name: Health | Display per-node health summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} {{ node_ip }};
+          MySQL container={{ _hc_mysql_container.stdout | default('UNAVAILABLE') }};
+          MySQL status={{ _hc_mysql.stdout_lines | default(['UNAVAILABLE']) | join('; ') }};
+          Orchestrator SHOW REPLICAS by host={{ _hc_orchestrator_mysql.results | default([]) | map(attribute='item') | zip(_hc_orchestrator_mysql.results | default([]) | map(attribute='rc')) | list }} (accounts={{ _hc_orchestrator_mysql.results | default([]) | map(attribute='stdout_lines') | list }});
+          Orchestrator API={{ 'OK' if _hc_orchestrator.status | default(0) == 200 else 'HTTP ' ~ (_hc_orchestrator.status | default(0) | string) }}.
+          API response={{ _hc_orchestrator.json | default(_hc_orchestrator.content | default(_hc_orchestrator.msg | default('no response body'))) | string | truncate(1400) }}.
+          Discovered clusters={{ _hc_orchestrator_clusters.json | default('UNAVAILABLE') }}.
+          Failure analysis={{ _hc_orchestrator_analysis.json | default(_hc_orchestrator_analysis.content | default('UNAVAILABLE')) | string | truncate(1200) }}.
+          Recovery diagnostics={{ _hc_orchestrator_audit.results | default([]) | map(attribute='content') | list }}.
+          Instance checks: valid={{ _hc_orchestrator_instances.results | map(attribute='content') | map('from_json') | map(attribute='IsLastCheckValid') | list }} recently_checked={{ _hc_orchestrator_instances.results | map(attribute='content') | map('from_json') | map(attribute='IsRecentlyChecked') | list }} last_seen_seconds={{ _hc_orchestrator_instances.results | map(attribute='content') | map('from_json') | map(attribute='SecondsSinceLastSeen') | list }} io_errors={{ _hc_orchestrator_instances.results | map(attribute='content') | map('from_json') | map(attribute='LastIOError') | list }} sql_errors={{ _hc_orchestrator_instances.results | map(attribute='content') | map('from_json') | map(attribute='LastSQLError') | list }}.
+          Cluster recovery info={{ _hc_orchestrator_cluster_info.content | default('unavailable') | string | truncate(1500) }}.
+          See the Orchestrator topology API only as its most recent observed view.
+      tags: [healthcheck]
+
+- name: Probe the single client VIP endpoint
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Health | Test VIP application connection and writable role
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "MYSQL_PWD={{ mysql_app_password }}"
+          - "{{ mysql_container_name }}"
+          - mysql
+          - "-h{{ mysql_vip }}"
+          - "-P{{ mysql_port }}"
+          - "-u{{ mysql_app_user }}"
+          - -NBe
+          - "SELECT CONCAT('server_id=',@@server_id,' read_only=',@@read_only,' super_read_only=',@@super_read_only)"
+      register: _hc_vip
+      changed_when: false
+      failed_when: false
+      no_log: true
+      tags: [healthcheck]
+
+    - name: Health | Report VIP result
+      ansible.builtin.debug:
+        msg: >-
+          Client probe from {{ inventory_hostname }} to VIP
+          {{ mysql_vip }}:{{ mysql_port }}:
+          rc={{ _hc_vip.rc | default('UNAVAILABLE') }}
+          {{ _hc_vip.stdout | default('UNAVAILABLE') }}
+          error={{ _hc_vip.stderr | default('') | trim }}
+      tags: [healthcheck]

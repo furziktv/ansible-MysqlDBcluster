@@ -1,0 +1,16 @@
+- name: Monitoring | Refuse to claim monitoring is enabled before exporters are deployed
+  ansible.builtin.assert:
+    that: not (monitoring_enabled | bool)
+    fail_msg: >-
+      Monitoring exporters are not deployed by this project. Refusing to open
+      exporter ports or report monitoring as enabled; add and validate
+      authenticated exporter containers before enabling this variable.
+  tags: [monitoring]
+
+- name: Monitoring | Report that exporters are intentionally not installed
+  ansible.builtin.debug:
+    msg: >-
+      Exporters are not installed. Add authenticated mysqld_exporter and
+      node_exporter containers with a restricted Prometheus scrape network;
+      the {{ mysql_monitor_user }} account is prepared for a future exporter.
+  tags: [monitoring]

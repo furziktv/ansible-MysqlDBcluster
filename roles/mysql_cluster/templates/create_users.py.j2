@@ -1,0 +1,44 @@
+USER = {{ mysql_cluster_admin_user | to_json }}
+PASSWORD = {{ mysql_cluster_admin_password | to_json }}
+MONITOR = {{ mysql_monitor_user | to_json }}
+MONITOR_PASS = {{ mysql_monitor_password | to_json }}
+APP = {{ mysql_app_user | to_json }}
+APP_PASS = {{ mysql_app_password | to_json }}
+DB = {{ mysql_app_database | to_json }}
+SEED = {{ groups['mysql_cluster'] | map('extract', hostvars, 'node_ip') | first | to_json }}
+PORT = {{ mysql_port }}
+
+def identifier(value):
+    return "`" + value.replace("`", "``") + "`"
+
+def literal(value):
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+probe = mysql.get_session({"scheme": "mysql", "host": SEED, "port": PORT,
+                           "user": USER, "password": PASSWORD})
+row = probe.run_sql("SELECT MEMBER_HOST FROM performance_schema.replication_group_members "
+                    "WHERE MEMBER_ROLE='PRIMARY' AND MEMBER_STATE='ONLINE'").fetch_one()
+if not row:
+    raise RuntimeError("MANUAL INTERVENTION REQUIRED: no ONLINE PRIMARY")
+shell.connect({"scheme": "mysql", "host": row[0], "port": PORT,
+               "user": USER, "password": PASSWORD})
+s = shell.get_session()
+
+accounts = [
+    (MONITOR, MONITOR_PASS, "127.0.0.1"),
+    (MONITOR, MONITOR_PASS, "{{ mysql_admin_account_host }}"),
+    (APP, APP_PASS, "127.0.0.1"),
+    (APP, APP_PASS, "{{ mysql_app_account_host }}"),
+]
+for name, password, host in accounts:
+    account = literal(name) + "@" + literal(host)
+    s.run_sql("CREATE USER IF NOT EXISTS " + account + " IDENTIFIED BY " + literal(password))
+s.run_sql("GRANT REPLICATION CLIENT ON *.* TO " + literal(MONITOR) + "@'127.0.0.1'")
+s.run_sql("GRANT SELECT ON performance_schema.* TO " + literal(MONITOR) + "@'127.0.0.1'")
+s.run_sql("GRANT REPLICATION CLIENT ON *.* TO " + literal(MONITOR) + "@'{{ mysql_admin_account_host }}'")
+s.run_sql("GRANT SELECT ON performance_schema.* TO " + literal(MONITOR) + "@'{{ mysql_admin_account_host }}'")
+s.run_sql("GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, SHOW VIEW ON "
+          + identifier(DB) + ".* TO " + literal(APP) + "@'127.0.0.1'")
+s.run_sql("GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, SHOW VIEW ON "
+          + identifier(DB) + ".* TO " + literal(APP) + "@'{{ mysql_app_account_host }}'")
+print("ACCOUNTS_READY")

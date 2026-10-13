@@ -1,0 +1,4 @@
+---
+# Monitoring is deliberately disabled until exporter containers and their
+# authenticated network policy are implemented.
+monitoring_enabled: false

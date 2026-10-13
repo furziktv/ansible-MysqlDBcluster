@@ -1,0 +1,209 @@
+---
+- name: Cluster | Verify classic MySQL connectivity to every peer before AdminAPI work
+  ansible.builtin.wait_for:
+    host: "{{ hostvars[item].node_ip }}"
+    port: "{{ mysql_port }}"
+    timeout: 10
+    state: started
+  loop: "{{ groups['mysql_cluster'] }}"
+  when: item != inventory_hostname
+  tags: [cluster]
+
+- name: Cluster | Pull MySQL Shell image
+  community.docker.docker_image:
+    name: "{{ mysql_shell_image }}"
+    source: pull
+  tags: [cluster]
+
+- name: Cluster | Verify pinned MySQL Shell version inside image
+  ansible.builtin.command:
+    argv: [docker, run, --rm, --entrypoint, mysqlsh, "{{ mysql_shell_image }}", --version]
+  register: _mysql_shell_image_version
+  changed_when: false
+  failed_when: _mysql_shell_image_version.rc != 0 or mysql_shell_version not in _mysql_shell_image_version.stdout
+  tags: [cluster]
+
+- name: Cluster | Render per-node configure script
+  ansible.builtin.template:
+    src: configure_instance.py.j2
+    dest: /var/lib/mysql-shell/configure_instance.py
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  tags: [cluster]
+
+- name: Cluster | Configure each instance and create AdminAPI user locally
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --rm
+      - --entrypoint
+      - mysqlsh
+      - --user
+      - 0:0
+      - --network
+      - host
+      - -v
+      - /var/lib/mysql-shell/configure_instance.py:/script.py:ro
+      - -v
+      - "{{ mysql_run_dir }}:/var/run/mysqld"
+      - "{{ mysql_shell_image }}"
+      - --py
+      - -f
+      - /script.py
+  register: _configure_instance
+  changed_when: "'INSTANCE_CONFIGURED' in _configure_instance.stdout"
+  no_log: "{{ not (mysql_cluster_debug | default(false) | bool) }}"
+  tags: [cluster]
+
+- name: Cluster | Render bootstrap script
+  ansible.builtin.template:
+    src: bootstrap_cluster.py.j2
+    dest: /var/lib/mysql-shell/bootstrap_cluster.py
+    owner: root
+    group: root
+    mode: "0600"
+  run_once: true
+  delegate_to: "{{ groups['mysql_cluster'][0] }}"
+  no_log: true
+  tags: [cluster]
+
+- name: Cluster | Idempotently create cluster and add missing members incrementally
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --rm
+      - --entrypoint
+      - mysqlsh
+      - --user
+      - 0:0
+      - --network
+      - host
+      - -v
+      - /var/lib/mysql-shell/bootstrap_cluster.py:/script.py:ro
+      - "{{ mysql_shell_image }}"
+      - --py
+      - -f
+      - /script.py
+  run_once: true
+  delegate_to: "{{ groups['mysql_cluster'][0] }}"
+  register: _cluster_bootstrap
+  changed_when: "'CLUSTER_CREATED' in _cluster_bootstrap.stdout or 'ADDED ' in _cluster_bootstrap.stdout"
+  no_log: "{{ not (mysql_cluster_debug | default(false) | bool) }}"
+  tags: [cluster]
+
+- name: Cluster | Wait for all three members to be ONLINE
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "MYSQL_PWD={{ mysql_cluster_admin_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - "-h{{ node_ip }}"
+      - "-u{{ mysql_cluster_admin_user }}"
+      - -NBe
+      - "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE='ONLINE'"
+  register: _gr_online
+  until: _gr_online.stdout | trim | int == 3
+  retries: 30
+  delay: 10
+  changed_when: false
+  no_log: true
+  tags: [cluster]
+
+- name: Cluster | Require exactly one ONLINE PRIMARY
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "MYSQL_PWD={{ mysql_cluster_admin_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - "-h{{ node_ip }}"
+      - "-u{{ mysql_cluster_admin_user }}"
+      - -NBe
+      - "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE='ONLINE' AND MEMBER_ROLE='PRIMARY'"
+  register: _gr_primary
+  changed_when: false
+  failed_when: _gr_primary.stdout | trim | int != 1
+  no_log: true
+  tags: [cluster]
+
+- name: Cluster | Identify the local PRIMARY for application database provisioning
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "MYSQL_PWD={{ mysql_cluster_admin_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - "-h{{ node_ip }}"
+      - "-u{{ mysql_cluster_admin_user }}"
+      - -NBe
+      - "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_HOST='{{ node_ip }}' AND MEMBER_STATE='ONLINE' AND MEMBER_ROLE='PRIMARY'"
+  register: _gr_local_primary
+  changed_when: false
+  no_log: true
+  tags: [cluster]
+
+- name: Cluster | Create application database on PRIMARY using local root socket
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "MYSQL_PWD={{ mysql_root_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - --protocol=socket
+      - --socket=/var/run/mysqld/mysqld.sock
+      - -uroot
+      - -e
+      - "CREATE DATABASE IF NOT EXISTS `{{ mysql_app_database | replace('`', '``') }}`"
+  when: _gr_local_primary.stdout | trim | int == 1
+  changed_when: false
+  no_log: true
+  tags: [cluster]
+
+- name: Cluster | Render account setup script
+  ansible.builtin.template:
+    src: create_users.py.j2
+    dest: /var/lib/mysql-shell/create_users.py
+    owner: root
+    group: root
+    mode: "0600"
+  run_once: true
+  delegate_to: "{{ groups['mysql_cluster'][0] }}"
+  no_log: true
+  tags: [cluster]
+
+- name: Cluster | Create scoped monitoring and application accounts on PRIMARY
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --rm
+      - --entrypoint
+      - mysqlsh
+      - --user
+      - 0:0
+      - --network
+      - host
+      - -v
+      - /var/lib/mysql-shell/create_users.py:/script.py:ro
+      - "{{ mysql_shell_image }}"
+      - --py
+      - -f
+      - /script.py
+  run_once: true
+  delegate_to: "{{ groups['mysql_cluster'][0] }}"
+  changed_when: false
+  no_log: "{{ not (mysql_cluster_debug | default(false) | bool) }}"
+  tags: [cluster]

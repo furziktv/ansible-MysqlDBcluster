@@ -1,0 +1,80 @@
+---
+- name: Bootstrap Python and SSH key authentication
+  hosts: mysql_cluster
+  become: true
+  gather_facts: false
+  vars:
+    bootstrap_ssh_key_path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/id_ed25519.pub"
+    bootstrap_ssh_key: "{{ lookup('ansible.builtin.file', bootstrap_ssh_key_path, errors='ignore') | default('', true) | trim }}"
+  tasks:
+    - name: Bootstrap | Verify Ansible become access
+      ansible.builtin.raw: id -u
+      register: _bootstrap_uid
+      changed_when: false
+      failed_when: _bootstrap_uid.stdout | trim != '0'
+      tags: [bootstrap]
+
+    - name: Bootstrap | Install Python and minimum host utilities without Python dependency
+      ansible.builtin.raw: >-
+        sh -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y
+        python3 sudo openssh-server ca-certificates'
+      register: _bootstrap_packages
+      changed_when: "'0 newly installed' not in _bootstrap_packages.stdout"
+      tags: [bootstrap]
+
+    - name: Bootstrap | Gather facts after Python installation
+      ansible.builtin.setup:
+      tags: [bootstrap]
+
+    - name: Bootstrap | Resolve the SSH user's home directory
+      ansible.builtin.command:
+        argv: [getent, passwd, "{{ ansible_user }}"]
+      register: _bootstrap_passwd
+      changed_when: false
+      failed_when: _bootstrap_passwd.rc != 0 or (_bootstrap_passwd.stdout.split(':') | length < 6)
+      tags: [bootstrap]
+
+    - name: Bootstrap | Record resolved SSH home
+      ansible.builtin.set_fact:
+        bootstrap_ssh_user_home: "{{ _bootstrap_passwd.stdout.split(':')[5] }}"
+      tags: [bootstrap]
+
+    - name: Bootstrap | Ensure SSH directory permissions
+      ansible.builtin.file:
+        path: "{{ bootstrap_ssh_user_home }}/.ssh"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0700"
+      tags: [bootstrap]
+
+    - name: Bootstrap | Add the controller public key and preserve existing keys
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        key: "{{ bootstrap_ssh_key }}"
+        state: present
+        exclusive: false
+      when: bootstrap_ssh_key | length > 0
+      no_log: true
+      tags: [bootstrap]
+
+    - name: Bootstrap | Inspect authorized_keys after optional key install
+      ansible.builtin.stat:
+        path: "{{ bootstrap_ssh_user_home }}/.ssh/authorized_keys"
+      register: _bootstrap_authorized_keys
+      tags: [bootstrap]
+
+    - name: Bootstrap | Set authorized_keys permissions when present
+      ansible.builtin.file:
+        path: "{{ bootstrap_ssh_user_home }}/.ssh/authorized_keys"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+      when: _bootstrap_authorized_keys.stat.exists
+      tags: [bootstrap]
+
+    - name: Bootstrap | Explain next step if no controller key exists
+      ansible.builtin.debug:
+        msg: "No public key was found at {{ bootstrap_ssh_key_path }}. Generate an Ed25519 key and re-run bootstrap. SSH password authentication remains enabled."
+      when: bootstrap_ssh_key | length == 0
+      tags: [bootstrap]

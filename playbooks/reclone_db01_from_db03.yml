@@ -1,0 +1,396 @@
+---
+# One-off recovery for the reviewed 2026-10-09 topology. MySQL Clone replaces
+# db01's datadir and discards its isolated GTID. Do not reuse for another event.
+- name: Verify the exact db03-primary topology before replacing db01
+  hosts: mysql_cluster
+  gather_facts: false
+  become: true
+  tags: [reclone_preflight]
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  tasks:
+    - name: Reclone | Require the incident-specific confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_reclone_db01_from_db03 | default('NO') == 'YES_DISCARD_DB01_EXTRA_GTID'
+        fail_msg: "Refusing to replace db01 without the exact confirmation string."
+
+    - name: Reclone | Inspect the managed datadir without following symlinks
+      ansible.builtin.stat:
+        path: /srv/mysql/data
+        follow: false
+      register: _datadir
+
+    - name: Reclone | Require a local datadir and the project marker
+      ansible.builtin.assert:
+        that:
+          - _datadir.stat.isdir
+          - not _datadir.stat.islnk
+          - mysql_managed_marker == '/srv/mysql/.ansible-managed'
+
+    - name: Reclone | Check the project ownership marker
+      ansible.builtin.stat:
+        path: "{{ mysql_managed_marker }}"
+        follow: false
+      register: _managed_marker
+
+    - name: Reclone | Refuse unowned MySQL data
+      ansible.builtin.assert:
+        that:
+          - _managed_marker.stat.isreg
+          - not _managed_marker.stat.islnk
+
+    - name: Reclone | Read identity, role, channel, GTID, and Clone plugin
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "$1"
+          - mysql-reclone
+          - >-
+            SELECT @@server_id,@@version,@@server_uuid,@@read_only,@@super_read_only,
+            COALESCE((SELECT HOST FROM performance_schema.replication_connection_configuration LIMIT 1),'NONE'),
+            COALESCE((SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1),'OFF'),
+            COALESCE((SELECT SERVICE_STATE FROM performance_schema.replication_applier_status LIMIT 1),'OFF'),
+            REPLACE(REPLACE(@@global.gtid_executed,CHAR(10),''),CHAR(13),''),
+            COALESCE((SELECT PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME='clone'),'ABSENT')
+      register: _role
+      changed_when: false
+
+    - name: Reclone | Save donor identity and GTID for cross-host checks
+      ansible.builtin.set_fact:
+        reclone_donor_uuid: "{{ _role.stdout.split('\t')[2] }}"
+        reclone_donor_gtid: "{{ _role.stdout.split('\t')[8] }}"
+      when: inventory_hostname == 'db03'
+
+    - name: Reclone | Require precisely the reviewed three-node roles
+      ansible.builtin.assert:
+        that:
+          - _role.stdout.split('\t') | length == 10
+          - _role.stdout.split('\t')[0] | int == mysql_server_id
+          - _role.stdout.split('\t')[1] == mysql_version
+          - _role.stdout.split('\t')[9] == 'ACTIVE'
+          - >-
+            (inventory_hostname == 'db03' and _role.stdout.split('\t')[3:8] == ['0','0','NONE','OFF','OFF'])
+            or (inventory_hostname == 'db02' and _role.stdout.split('\t')[3:8] == ['1','1','10.100.0.3','ON','ON'])
+            or (inventory_hostname == 'db01' and _role.stdout.split('\t')[3:8] == ['1','1','NONE','OFF','OFF'])
+        fail_msg: "The live roles no longer match db03 primary / db02 replica / db01 detached."
+
+    - name: Reclone | Check VIP ownership on every node
+      ansible.builtin.command:
+        argv: [ip, -o, -4, addr, show]
+      register: _ip_addresses
+      changed_when: false
+
+    - name: Reclone | Require the VIP exclusively on db03
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('10.100.0.5/16' in _ip_addresses.stdout) == (inventory_hostname == 'db03')
+
+    - name: Reclone | Require the expected extra db01 GTID
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "$1"
+          - mysql-reclone
+          - >-
+            SELECT GTID_SUBTRACT(@@global.gtid_executed,
+            '{{ hostvars['db03'].reclone_donor_gtid }}')
+      register: _extra_gtid
+      changed_when: false
+      when: inventory_hostname == 'db01'
+
+    - name: Reclone | Refuse another divergent history
+      ansible.builtin.assert:
+        that: _extra_gtid.stdout | trim == 'a06771df-bdfe-11f1-a682-bc24112b458c:451836'
+        fail_msg: "db01 has a different set of extra GTIDs; review again before replacing data."
+      when: inventory_hostname == 'db01'
+
+    - name: Reclone | Require target to restart read-only after cloning
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "SELECT GROUP_CONCAT(CONCAT(VARIABLE_NAME,'=',VARIABLE_VALUE)
+            ORDER BY VARIABLE_NAME SEPARATOR ',') FROM performance_schema.persisted_variables
+            WHERE VARIABLE_NAME IN ('read_only','super_read_only')"
+      register: _fenced_defaults
+      changed_when: false
+      when: inventory_hostname == 'db01'
+
+    - name: Reclone | Require persisted db01 read-only defaults
+      ansible.builtin.assert:
+        that: _fenced_defaults.stdout | trim == 'read_only=ON,super_read_only=ON'
+      when: inventory_hostname == 'db01'
+
+    - name: Reclone | Check donor application tables use InnoDB
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "SELECT COUNT(*) FROM information_schema.tables
+            WHERE TABLE_SCHEMA NOT IN ('mysql','performance_schema','information_schema','sys')
+            AND ENGINE <> 'InnoDB'"
+      register: _non_innodb
+      changed_when: false
+      when: inventory_hostname == 'db03'
+
+    - name: Reclone | Refuse to omit non-InnoDB donor tables
+      ansible.builtin.assert:
+        that: _non_innodb.stdout | trim == '0'
+      when: inventory_hostname == 'db03'
+
+    - name: Reclone | Measure donor data size
+      ansible.builtin.command:
+        argv: [du, -sb, /srv/mysql/data]
+      register: _donor_bytes
+      changed_when: false
+      when: inventory_hostname == 'db03'
+
+    - name: Reclone | Save donor size for the recipient space check
+      ansible.builtin.set_fact:
+        reclone_donor_data_bytes: "{{ _donor_bytes.stdout.split()[0] }}"
+      when: inventory_hostname == 'db03'
+
+    - name: Reclone | Measure free bytes on the recipient filesystem
+      ansible.builtin.shell: df -B1 --output=avail /srv/mysql/data | tail -n 1
+      register: _recipient_free
+      changed_when: false
+      when: inventory_hostname == 'db01'
+
+    - name: Reclone | Require donor size plus 2 GiB available on db01
+      ansible.builtin.assert:
+        that:
+          - _recipient_free.stdout | trim | int > (hostvars['db03'].reclone_donor_data_bytes | int + 2147483648)
+      when: inventory_hostname == 'db01'
+
+- name: Give db03's replication account temporary Clone donor access
+  hosts: db03
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Reclone | Grant temporary BACKUP_ADMIN
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot
+        stdin: "GRANT BACKUP_ADMIN ON *.* TO 'replicator'@'10.100.0.%';"
+      changed_when: true
+
+- name: Replace detached db01 data using db03's MySQL Clone
+  hosts: db01
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  tasks:
+    - name: Reclone | Restrict Clone donor to db03
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot
+        stdin: "SET GLOBAL clone_valid_donor_list='10.100.0.3:3306';"
+      changed_when: true
+
+    - name: Reclone | Keep recipient read-only while allowing Clone
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot
+        stdin: "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=OFF;"
+      changed_when: true
+
+    - name: Reclone | Replace db01 datadir from db03
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot
+        stdin: >-
+          CLONE INSTANCE FROM 'replicator'@'10.100.0.3':3306
+          IDENTIFIED BY '{{ mysql_replication_password | replace('\\', '\\\\') | replace("'", "\\'") }}';
+      register: _clone_command
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+- name: Revoke donor privilege even if Clone returned a connection error
+  hosts: db03
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Reclone | Revoke temporary BACKUP_ADMIN
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot
+        stdin: "REVOKE BACKUP_ADMIN ON *.* FROM 'replicator'@'10.100.0.%';"
+      changed_when: true
+
+- name: Verify cloned db01 and attach it read-only to db03
+  hosts: db01
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Reclone | Wait for MySQL after its automatic Clone restart
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "SELECT @@server_id,@@server_uuid,@@read_only,@@super_read_only"
+      register: _cloned_state
+      until: _cloned_state.rc == 0
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: Reclone | Restore the super-read-only fence
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot
+        stdin: "SET GLOBAL super_read_only=ON;"
+      changed_when: false
+
+    - name: Reclone | Read fenced recipient identity
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "SELECT @@server_id,@@server_uuid,@@read_only,@@super_read_only"
+      register: _cloned_state
+      changed_when: false
+
+    - name: Reclone | Require distinct identity and read-only recipient
+      ansible.builtin.assert:
+        that:
+          - _cloned_state.stdout.split('\t')[0] == '1'
+          - _cloned_state.stdout.split('\t')[1] != hostvars['db03'].reclone_donor_uuid
+          - _cloned_state.stdout.split('\t')[2:4] == ['1','1']
+
+    - name: Reclone | Confirm MySQL Clone completed
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "SELECT STATE FROM performance_schema.clone_status ORDER BY ID DESC LIMIT 1"
+      register: _clone_status
+      changed_when: false
+
+    - name: Reclone | Require a completed replacement before rejoining
+      ansible.builtin.assert:
+        that: _clone_status.stdout | trim | upper == 'COMPLETED'
+
+    - name: Reclone | Trigger the guarded rejoin controller
+      ansible.builtin.systemd:
+        name: mysql-safe-rejoin.service
+        state: started
+
+    - name: Reclone | Wait for db01 to replicate from db03
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - mysql
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "SELECT
+            COALESCE((SELECT HOST FROM performance_schema.replication_connection_configuration LIMIT 1),'NONE'),
+            COALESCE((SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1),'OFF'),
+            COALESCE((SELECT SERVICE_STATE FROM performance_schema.replication_applier_status LIMIT 1),'OFF'),
+            @@read_only,@@super_read_only"
+      register: _attached_state
+      until: _attached_state.rc == 0 and _attached_state.stdout | trim == "10.100.0.3\tON\tON\t1\t1"
+      retries: 60
+      delay: 5
+      changed_when: false

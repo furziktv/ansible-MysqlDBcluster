@@ -1,0 +1,2 @@
+---
+mysql_router_config_file: "{{ mysql_router_dir }}/mysqlrouter.conf"

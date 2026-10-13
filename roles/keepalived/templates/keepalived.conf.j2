@@ -1,0 +1,47 @@
+# Managed by Ansible — VRRP for the writable MySQL primary.
+# Priority: db01 > db02 > db03 initially, but MASTER is whoever wins
+# the election. nopreempt prevents the returning higher-priority db01
+# from moving the VIP back unnecessarily. Health is gated by local MySQL and
+# Orchestrator's current topology view; verify failover on the target L2.
+global_defs {
+  router_id {{ inventory_hostname }}
+  enable_script_security
+  # The health and notify scripts need Docker socket access; Ubuntu does not
+  # create Keepalived's default keepalived_script account automatically.
+  script_user root
+}
+
+vrrp_script chk_mysql_primary {
+  script "/etc/keepalived/chk_mysql_primary.sh"
+  interval {{ keepalived_probe_interval_seconds }}
+  fall {{ keepalived_probe_fall_count }}
+  rise {{ keepalived_probe_rise_count }}
+}
+
+vrrp_instance VI_MYSQL {
+  state BACKUP
+  interface {{ keepalived_effective_interface }}
+  virtual_router_id {{ keepalived_router_id }}
+  priority {{ keepalived_vrrp_priority_base - (mysql_server_id | int) + 1 + 50 }}
+  advert_int 1
+  nopreempt
+  unicast_src_ip {{ node_ip }}
+  unicast_peer {
+{% for peer in cluster_nodes if peer != node_ip %}
+    {{ peer }}
+{% endfor %}
+  }
+  authentication {
+    auth_type PASS
+    auth_pass {{ keepalived_auth_pass[:8] }}
+  }
+  virtual_ipaddress {
+    {{ mysql_vip }}/{{ mysql_vip_cidr }} dev {{ keepalived_effective_interface }}
+  }
+  track_script {
+    chk_mysql_primary
+  }
+  notify_master "/etc/keepalived/notify.sh MASTER"
+  notify_backup "/etc/keepalived/notify.sh BACKUP"
+  notify_fault "/etc/keepalived/notify.sh FAULT"
+}

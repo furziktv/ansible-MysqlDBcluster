@@ -1,0 +1,94 @@
+---
+- name: Orchestrator | Ensure persistent paths exist with image ownership
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ orchestrator_container_uid }}"
+    group: "{{ orchestrator_container_gid }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ orchestrator_data_dir }}", mode: "0750" }
+    - { path: "{{ orchestrator_config_dir }}", mode: "0750" }
+  tags: [orchestrator]
+
+- name: Orchestrator | Pull pinned image
+  community.docker.docker_image:
+    name: "{{ orchestrator_image }}"
+    source: pull
+  tags: [orchestrator]
+
+- name: Orchestrator | Render Raft configuration
+  ansible.builtin.template:
+    src: orchestrator.conf.json.j2
+    dest: "{{ orchestrator_config_dir }}/orchestrator.conf.json"
+    owner: 1001
+    group: 1001
+    mode: "0600"
+  no_log: true
+  tags: [orchestrator]
+
+- name: Orchestrator | Render Compose definition
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ orchestrator_compose_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  no_log: true
+  tags: [orchestrator]
+
+- name: Orchestrator | Start local Raft member
+  community.docker.docker_compose_v2:
+    project_src: /srv/orchestrator
+    state: present
+    pull: missing
+  tags: [orchestrator]
+
+- name: Orchestrator | Read the rendered configuration checksum
+  ansible.builtin.stat:
+    path: "{{ orchestrator_config_dir }}/orchestrator.conf.json"
+    checksum_algorithm: sha256
+  register: _orchestrator_config_stat
+  tags: [orchestrator]
+
+- name: Orchestrator | Read the last loaded configuration checksum
+  ansible.builtin.command:
+    argv:
+      - cat
+      - "{{ orchestrator_config_dir }}/.loaded-config-sha256"
+  register: _orchestrator_loaded_config
+  changed_when: false
+  failed_when: false
+  tags: [orchestrator]
+
+- name: Orchestrator | Restart the container when the mounted configuration changed
+  ansible.builtin.command:
+    argv:
+      - docker
+      - restart
+      - orchestrator
+  register: _orchestrator_config_restart
+  changed_when: true
+  when: >-
+    _orchestrator_loaded_config.rc != 0 or
+    _orchestrator_loaded_config.stdout | trim != _orchestrator_config_stat.stat.checksum
+  tags: [orchestrator]
+
+- name: Orchestrator | Record the configuration loaded by the container
+  ansible.builtin.copy:
+    dest: "{{ orchestrator_config_dir }}/.loaded-config-sha256"
+    content: "{{ _orchestrator_config_stat.stat.checksum }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  when: >-
+    _orchestrator_loaded_config.rc != 0 or
+    _orchestrator_loaded_config.stdout | trim != _orchestrator_config_stat.stat.checksum
+  tags: [orchestrator]
+
+- name: Orchestrator | Wait for local HTTP listener
+  ansible.builtin.wait_for:
+    host: "{{ node_ip }}"
+    port: "{{ orchestrator_http_port }}"
+    timeout: 60
+  tags: [orchestrator]

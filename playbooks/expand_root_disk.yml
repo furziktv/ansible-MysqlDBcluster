@@ -1,0 +1,110 @@
+---
+# Grow the already-expanded VM disk. This playbook does not resize a virtual
+# disk in the hypervisor, delete files, or alter MySQL/replication state.
+# Confirmed layout on db01/db03 (2026-10-08):
+# /dev/sda -> /dev/sda3 (PV) -> ubuntu-vg/ubuntu-lv -> ext4 mounted at /.
+- name: Expand the validated root LVM filesystem to all available VM disk space
+  hosts: mysql_cluster
+  become: true
+  gather_facts: false
+  serial: 1
+  vars:
+    confirm_expand_root_lvm: "NO"
+  tasks:
+    - name: Disk | Require explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_expand_root_lvm == 'YES_EXPAND_ROOT_LVM'
+        fail_msg: >-
+          REFUSED: first enlarge the VM disk in the hypervisor and verify its
+          backup. Then pass -e confirm_expand_root_lvm=YES_EXPAND_ROOT_LVM.
+
+    - name: Disk | Refuse any unexpected root storage layout or missing tool
+      ansible.builtin.raw: |
+        set -eu
+        test "$(id -u)" = 0
+        test -b /dev/sda
+        test -b /dev/sda3
+        test -b /dev/ubuntu-vg/ubuntu-lv
+        test "$(findmnt -n -o FSTYPE /)" = ext4
+        test "$(readlink -f "$(findmnt -n -o SOURCE /)")" = "$(readlink -f /dev/ubuntu-vg/ubuntu-lv)"
+        test "$(lsblk -nro PKNAME /dev/sda3 | head -n 1)" = sda
+        test "$(pvs --noheadings -o vg_name /dev/sda3 | tr -d '[:space:]')" = ubuntu-vg
+        test "$(pvs --noheadings -o pv_name -S vg_name=ubuntu-vg | wc -l)" -eq 1
+        test "$(lvs --noheadings -o lv_name -S vg_name=ubuntu-vg | wc -l)" -eq 1
+        for tool in growpart pvresize vgs lvextend resize2fs blockdev findmnt; do
+          command -v "$tool" >/dev/null
+        done
+      register: _disk_layout
+      changed_when: false
+      failed_when: _disk_layout.rc != 0
+
+    - name: Disk | Record original disk and root filesystem sizes
+      ansible.builtin.raw: |
+        blockdev --getsize64 /dev/sda
+        df -PB1 / | awk 'NR == 2 {print $2, $4}'
+      register: _disk_before
+      changed_when: false
+
+    - name: Disk | Grow partition 3 to the end of the available virtual disk
+      ansible.builtin.raw: TMPDIR=/run growpart --fudge 0 /dev/sda 3
+      register: _disk_growpart
+      changed_when: "'CHANGED:' in _disk_growpart.stdout"
+      failed_when: >-
+        _disk_growpart.rc != 0 and
+        'NOCHANGE:' not in _disk_growpart.stdout
+
+    - name: Disk | Resize the LVM physical volume
+      ansible.builtin.raw: pvresize /dev/sda3
+      register: _disk_pvresize
+      changed_when: "'1 physical volume(s) resized' in _disk_pvresize.stdout"
+
+    - name: Disk | Read free extents in the volume group
+      ansible.builtin.raw: vgs --noheadings -o vg_free_count ubuntu-vg
+      register: _disk_free_extents
+      changed_when: false
+      failed_when: >-
+        _disk_free_extents.rc != 0 or
+        not (_disk_free_extents.stdout | trim | regex_search('^[0-9]+$'))
+
+    - name: Disk | Assign all free extents to the root logical volume
+      ansible.builtin.raw: lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+      when: (_disk_free_extents.stdout | trim | int) > 0
+      register: _disk_lvextend
+      changed_when: true
+
+    - name: Disk | Expand ext4 online to fill the logical volume
+      ansible.builtin.raw: resize2fs /dev/ubuntu-vg/ubuntu-lv
+      register: _disk_resize2fs
+      changed_when: "'Nothing to do!' not in (_disk_resize2fs.stdout ~ _disk_resize2fs.stderr)"
+
+    - name: Disk | Read final sizes and free space
+      ansible.builtin.raw: |
+        blockdev --getsize64 /dev/sda
+        df -PB1 / | awk 'NR == 2 {print $2, $4}'
+        lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS /dev/sda
+      register: _disk_after
+      changed_when: false
+
+    - name: Disk | Read root filesystem available bytes
+      ansible.builtin.raw: df -PB1 / | awk 'NR == 2 {print $4}'
+      register: _disk_available_after
+      changed_when: false
+      failed_when: >-
+        _disk_available_after.rc != 0 or
+        not (_disk_available_after.stdout | trim | regex_search('^[0-9]+$'))
+
+    - name: Disk | Refuse to report success when the root filesystem is still full
+      ansible.builtin.assert:
+        that:
+          - (_disk_available_after.stdout | trim | int) > 0
+        fail_msg: >-
+          Root filesystem still has no available space. The hypervisor may not
+          have enlarged /dev/sda, or the partition/LVM change was not picked up.
+          Do not delete MySQL data or binlogs; inspect the recorded disk sizes.
+
+    - name: Disk | Show before and after capacity
+      ansible.builtin.debug:
+        msg:
+          - "Before: {{ _disk_before.stdout_lines | default([]) }}"
+          - "After: {{ _disk_after.stdout_lines | default([]) }}"

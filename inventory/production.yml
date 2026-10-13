@@ -1,0 +1,25 @@
+---
+all:
+  vars:
+    ansible_user: furzik
+    ansible_python_interpreter: auto_silent
+  children:
+    mysql_cluster:
+      hosts:
+        db01:
+          ansible_host: 10.100.0.1
+          node_ip: 10.100.0.1
+          mysql_server_id: 1
+        db02:
+          ansible_host: 10.100.0.2
+          node_ip: 10.100.0.2
+          mysql_server_id: 2
+        db03:
+          ansible_host: 10.100.0.3
+          node_ip: 10.100.0.3
+          mysql_server_id: 3
+      vars:
+        cluster_nodes:
+          - 10.100.0.1
+          - 10.100.0.2
+          - 10.100.0.3

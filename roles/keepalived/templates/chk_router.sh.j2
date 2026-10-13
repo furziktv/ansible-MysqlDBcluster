@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Managed by Ansible. Router health gate for keepalived.
+# Fails (non-zero) if local Router RW port is not accepting connections,
+# causing keepalived to drop priority and let the VIP float away.
+/usr/bin/nc -z -w 2 127.0.0.1 {{ mysql_router_write_port }}
+/usr/bin/docker inspect --format='{{'{{'}}.State.Health.Status{{'}}'}}' {{ mysql_router_container_name }} | /bin/grep -qx healthy
+APP_PASSWORD="$(/bin/cat {{ mysql_secrets_dir }}/mysql_app_password)"
+export MYSQL_PWD="${APP_PASSWORD}"
+/usr/bin/docker exec -e MYSQL_PWD="${MYSQL_PWD}" {{ mysql_container_name }} \
+  mysql --protocol=TCP -h127.0.0.1 -P{{ mysql_router_write_port }} \
+  -u{{ mysql_app_user }} -NBe 'SELECT @@global.read_only' | /bin/grep -qx 0

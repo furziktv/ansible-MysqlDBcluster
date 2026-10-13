@@ -1,0 +1,16 @@
+-- Persist fail-closed defaults for a future reboot while keeping the runtime
+-- instance fenced as a replica.
+SET PERSIST_ONLY read_only = ON;
+SET PERSIST_ONLY super_read_only = ON;
+SET PERSIST replica_net_timeout = {{ mysql_replica_net_timeout_seconds }};
+CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST='{{ hostvars[mysql_primary_host].node_ip }}',
+  SOURCE_PORT={{ mysql_port }},
+  SOURCE_USER='{{ mysql_replication_user }}',
+  SOURCE_PASSWORD='{{ mysql_replication_password | replace('\\', '\\\\') | replace("'", "\\'") }}',
+  SOURCE_AUTO_POSITION=1,
+  SOURCE_HEARTBEAT_PERIOD={{ mysql_replica_heartbeat_period_seconds }},
+  GET_SOURCE_PUBLIC_KEY=1;
+SET GLOBAL read_only = ON;
+SET GLOBAL super_read_only = ON;
+START REPLICA;

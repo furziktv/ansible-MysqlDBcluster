@@ -1,0 +1,144 @@
+---
+# Apply faster failover detection without restarting MySQL.
+# Orchestrator restarts are rolling (one Raft member at a time).
+- name: Roll out faster Orchestrator polling
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - { role: orchestrator, tags: [orchestrator] }
+
+- name: Roll out faster but debounced VIP health checks
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - { role: keepalived, tags: [keepalived] }
+
+- name: Persist short replication failure timeout and tune replica heartbeats
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Failover tuning | Require a healthy local MySQL container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format={{ '{{' }}.State.Health.Status{{ '}}' }}
+          - "{{ mysql_container_name }}"
+      register: _failover_mysql_health
+      changed_when: false
+      failed_when: _failover_mysql_health.rc != 0 or _failover_mysql_health.stdout | trim != 'healthy'
+
+    - name: Failover tuning | Read local role and replication channel count
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ mysql_container_name }}"
+          - sh
+          - -c
+          - >-
+            MYSQL_PWD="$(cat /run/secrets/mysql_root_password)"
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "SELECT @@global.read_only,
+            (SELECT COUNT(*) FROM performance_schema.replication_connection_configuration)"
+      register: _failover_replica_identity
+      changed_when: false
+      no_log: true
+
+    - name: Failover tuning | Parse local role
+      ansible.builtin.set_fact:
+        _failover_role_fields: "{{ _failover_replica_identity.stdout.split() }}"
+
+    - name: Failover tuning | Refuse an ambiguous or unsafe role
+      ansible.builtin.assert:
+        that:
+          - _failover_replica_identity.rc == 0
+          - _failover_role_fields | length == 2
+          - >-
+            (_failover_role_fields[0] == '0' and _failover_role_fields[1] == '0') or
+            (_failover_role_fields[0] == '1' and _failover_role_fields[1] == '1')
+        fail_msg: >-
+          Cannot safely classify {{ inventory_hostname }} as exactly one writable
+          primary or one fenced replica with a configured channel. No SQL tuning
+          was applied on this node.
+      no_log: true
+
+    - name: Failover tuning | Persist replica network timeout and adjust active channel heartbeat
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - "{{ mysql_container_name }}"
+          - sh
+          - -c
+          - >-
+            MYSQL_PWD="$(cat /run/secrets/mysql_root_password)"
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot
+        stdin: >-
+          SET PERSIST replica_net_timeout = {{ mysql_replica_net_timeout_seconds }};
+          {% if _failover_role_fields[1] | int == 1 %}
+          STOP REPLICA IO_THREAD;
+          CHANGE REPLICATION SOURCE TO
+            SOURCE_HEARTBEAT_PERIOD = {{ mysql_replica_heartbeat_period_seconds }};
+          START REPLICA IO_THREAD;
+          {% endif %}
+      register: _failover_tuning_sql
+      changed_when: _failover_tuning_sql.rc == 0
+      no_log: true
+
+    - name: Failover tuning | Verify timeout and heartbeat are applied
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ mysql_container_name }}"
+          - sh
+          - -c
+          - >-
+            MYSQL_PWD="$(cat /run/secrets/mysql_root_password)"
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "SELECT @@global.replica_net_timeout,
+            COALESCE((SELECT HEARTBEAT_INTERVAL FROM
+            performance_schema.replication_connection_configuration LIMIT 1), 0),
+            COALESCE((SELECT SERVICE_STATE FROM
+            performance_schema.replication_connection_status LIMIT 1), 'OFF'),
+            COALESCE((SELECT SERVICE_STATE FROM
+            performance_schema.replication_applier_status LIMIT 1), 'OFF')"
+      register: _failover_tuning_status
+      changed_when: false
+      no_log: true
+
+    - name: Failover tuning | Require values and replica threads to match
+      ansible.builtin.assert:
+        that:
+          - _failover_tuning_status.rc == 0
+          - _failover_tuning_status.stdout.split() | length == 4
+          - _failover_tuning_status.stdout.split()[0] | int == mysql_replica_net_timeout_seconds
+          - >-
+            (_failover_role_fields[1] | int == 0) or
+            ((_failover_tuning_status.stdout.split()[1] | float) == mysql_replica_heartbeat_period_seconds | float
+             and _failover_tuning_status.stdout.split()[2] == 'ON'
+             and _failover_tuning_status.stdout.split()[3] == 'ON')
+        fail_msg: >-
+          Failover timeout/heartbeat verification failed on {{ inventory_hostname }}.
+          Inspect MySQL replica status before proceeding to failover testing.
+      no_log: true

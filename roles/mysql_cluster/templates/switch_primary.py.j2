@@ -1,0 +1,14 @@
+USER = {{ mysql_cluster_admin_user | to_json }}
+PASSWORD = {{ mysql_cluster_admin_password | to_json }}
+SEED = {{ groups['mysql_cluster'] | map('extract', hostvars, 'node_ip') | first | to_json }}
+NAME = {{ mysql_cluster_name | to_json }}
+shell.connect({"scheme": "mysql", "host": SEED, "port": {{ mysql_port }}, "user": USER, "password": PASSWORD})
+c = dba.get_cluster(NAME)
+status = c.status({"extended": 1})["defaultReplicaSet"]["topology"]
+secondaries = [info.get("address", address) for address, info in status.items()
+               if info.get("status") == "ONLINE" and info.get("memberRole") == "SECONDARY"]
+if len(secondaries) < 2:
+    raise RuntimeError("MANUAL INTERVENTION REQUIRED: need two healthy SECONDARY candidates before controlled switchover")
+target = sorted(secondaries)[0]
+c.set_primary_instance(target)
+print("PRIMARY_SWITCHED=" + target)

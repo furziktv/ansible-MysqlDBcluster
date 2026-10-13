@@ -1,0 +1,65 @@
+---
+# A MySQL upgrade restarts replication members and can change GTID behavior.
+# Do not perform a routine Ansible deploy as an implicit rolling upgrade.
+- name: Inspect topology before a separately reviewed update
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Update | Inspect installed MySQL image and container state
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "image={{'{{'}}.Config.Image{{'}}'}} state={{'{{'}}.State.Status{{'}}'}} health={{'{{'}}.State.Health.Status{{'}}'}}"
+          - "{{ mysql_container_name }}"
+      register: _update_container
+      changed_when: false
+      failed_when: false
+      tags: [update]
+
+    - name: Update | Inspect current replication channel without changing it
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "MYSQL_PWD={{ mysql_root_password }}"
+          - "{{ mysql_container_name }}"
+          - mysql
+          - --protocol=socket
+          - --socket=/var/run/mysqld/mysqld.sock
+          - -uroot
+          - -NBe
+          - SHOW REPLICA STATUS
+      register: _update_replica
+      changed_when: false
+      failed_when: false
+      no_log: true
+      tags: [update]
+
+    - name: Update | Print safe high-level observation
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: container={{ _update_container.stdout | default('UNAVAILABLE') }};
+          replication={{ 'configured; details hidden' if (_update_replica.stdout | default('') | length > 0) else 'unavailable or no replica channel' }}
+      tags: [update]
+
+- name: Refuse unreviewed rolling upgrade
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Update | Require a release-specific runbook
+      ansible.builtin.fail:
+        msg: >-
+          No automatic rolling update is implemented for async replication.
+          Update playbook is intentionally fail-closed after read-only inventory
+          diagnostics. Review replication lag, current writable primary, GTID
+          compatibility, and failover procedures, then perform a release-specific
+          maintenance plan. No containers were changed.
+      tags: [update]

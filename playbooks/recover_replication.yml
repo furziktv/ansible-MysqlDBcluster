@@ -1,0 +1,222 @@
+---
+# One-time, non-destructive recovery after all nodes became detached roots.
+# db01 is promoted only after every other node's GTIDs are proven to be a
+# subset of db01 and the missing transactions are still present in db01 binlogs.
+- name: Verify detached nodes and select the GTID superset
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Recovery | Require the expected preserved topology markers
+      ansible.builtin.stat:
+        path: "/srv/mysql/{{ 'replication-seed-ready' if inventory_hostname == mysql_primary_host else 'replication-replica-ready' }}"
+      register: _recovery_marker
+
+    - name: Recovery | Require each instance marker
+      ansible.builtin.assert:
+        that: _recovery_marker.stat.exists
+        fail_msg: "Refusing recovery: {{ inventory_hostname }} lacks its expected replication marker."
+
+    - name: Recovery | Read MySQL role, GTID set, purged set, and configured source
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ mysql_container_name }}"
+          - sh
+          - -c
+          - >-
+            export MYSQL_PWD="$(cat /run/secrets/mysql_root_password)";
+            exec mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock
+            -uroot -NBe "SELECT @@server_id,
+            @@global.read_only, @@global.super_read_only,
+            REPLACE(REPLACE(@@global.gtid_executed, CHAR(10), ''), CHAR(13), ''),
+            REPLACE(REPLACE(@@global.gtid_purged, CHAR(10), ''), CHAR(13), ''),
+            COALESCE((SELECT HOST FROM performance_schema.replication_connection_configuration LIMIT 1), '')"
+      register: _recovery_mysql_state
+      changed_when: false
+
+    - name: Recovery | Require readable MySQL state
+      ansible.builtin.assert:
+        that:
+          - _recovery_mysql_state.rc == 0
+          - _recovery_mysql_state.stdout.split('\t') | length == 6
+          - _recovery_mysql_state.stdout.split('\t')[0] | int == mysql_server_id
+        fail_msg: "Cannot safely parse MySQL state on {{ inventory_hostname }}; no changes were made."
+
+    - name: Recovery | Record local state for cross-node GTID checks
+      ansible.builtin.set_fact:
+        recovery_read_only: "{{ _recovery_mysql_state.stdout.split('\t')[1] }}"
+        recovery_super_read_only: "{{ _recovery_mysql_state.stdout.split('\t')[2] }}"
+        recovery_gtid: "{{ _recovery_mysql_state.stdout.split('\t')[3] }}"
+        recovery_gtid_purged: "{{ _recovery_mysql_state.stdout.split('\t')[4] }}"
+        recovery_source: "{{ _recovery_mysql_state.stdout.split('\t')[5] }}"
+
+    - name: Recovery | Require nodes to be fenced and detached
+      ansible.builtin.assert:
+        that:
+          - recovery_read_only == '1'
+          - recovery_super_read_only == '1'
+          - recovery_source == ''
+          - recovery_gtid is match('^[A-Fa-f0-9:,\\-]*$')
+          - recovery_gtid | length > 0
+        fail_msg: >-
+          Refusing automatic promotion: {{ inventory_hostname }} is writable,
+          has an existing replication source, or has malformed/empty GTIDs.
+
+    - name: Recovery | Check whether each local GTID set is contained by db01
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "MYSQL_PWD={{ mysql_root_password }}"
+          - "{{ mysql_container_name }}"
+          - mysql
+          - --protocol=socket
+          - --socket=/var/run/mysqld/mysqld.sock
+          - -uroot
+          - -NBe
+          - >-
+            SELECT GTID_SUBSET(@@global.gtid_executed, '{{ hostvars[mysql_primary_host].recovery_gtid }}'),
+            GTID_SUBSET(GTID_SUBTRACT('{{ hostvars[mysql_primary_host].recovery_gtid }}', @@global.gtid_executed),
+            '{{ hostvars[mysql_primary_host].recovery_gtid_purged }}')
+      register: _recovery_gtid_compatibility
+      changed_when: false
+      no_log: true
+      when: inventory_hostname != mysql_primary_host
+
+    - name: Recovery | Require safe GTID auto-position on every replica
+      ansible.builtin.assert:
+        that:
+          - _recovery_gtid_compatibility.stdout | trim == '1\t0'
+        fail_msg: >-
+          Refusing promotion: {{ inventory_hostname }} is not a GTID subset of db01,
+          or db01 no longer has every transaction required by this replica.
+          Take a backup and resolve manually; no data is deleted or reset here.
+      when: inventory_hostname != mysql_primary_host
+
+    - name: Recovery | Verify replication account exists on db01
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "MYSQL_PWD={{ mysql_root_password }}"
+          - "{{ mysql_container_name }}"
+          - mysql
+          - --protocol=socket
+          - --socket=/var/run/mysqld/mysqld.sock
+          - -uroot
+          - -NBe
+          - >-
+            SELECT COUNT(*) FROM mysql.user
+            WHERE user='{{ mysql_replication_user }}'
+              AND host='{{ mysql_admin_account_host }}'
+      register: _recovery_replication_account
+      changed_when: false
+      no_log: true
+      when: inventory_hostname == mysql_primary_host
+
+    - name: Recovery | Require the existing replication account
+      ansible.builtin.assert:
+        that: _recovery_replication_account.stdout | trim | int == 1
+        fail_msg: "Refusing promotion: db01 has no expected replication account."
+      when: inventory_hostname == mysql_primary_host
+
+- name: Promote verified GTID superset and reattach replicas
+  hosts: mysql_cluster
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/vault.yml
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Recovery | Make the verified GTID superset writable
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - -e
+          - "MYSQL_PWD={{ mysql_root_password }}"
+          - "{{ mysql_container_name }}"
+          - mysql
+          - --protocol=socket
+          - --socket=/var/run/mysqld/mysqld.sock
+          - -uroot
+      args:
+        stdin: "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
+      register: _recovery_promote
+      changed_when: _recovery_promote.rc == 0
+      no_log: true
+      when: inventory_hostname == mysql_primary_host
+
+    - name: Recovery | Wait for Orchestrator to observe db01 as the unique writable root
+      ansible.builtin.uri:
+        url: "http://{{ node_ip }}:{{ orchestrator_http_port }}/api/instance/{{ hostvars[mysql_primary_host].node_ip }}/{{ mysql_port }}"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _recovery_primary_observed
+      until:
+        - not _recovery_primary_observed.json.ReadOnly
+        - _recovery_primary_observed.json.IsLastCheckValid
+        - _recovery_primary_observed.json.IsRecentlyChecked
+      retries: 24
+      delay: 5
+      no_log: true
+
+    - name: Recovery | Run guarded automatic rejoin on detached replicas
+      ansible.builtin.systemd:
+        name: mysql-safe-rejoin.service
+        state: started
+      when: inventory_hostname != mysql_primary_host
+
+    - name: Recovery | Wait for both MySQL replication threads
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "MYSQL_PWD={{ mysql_root_password }}"
+          - "{{ mysql_container_name }}"
+          - mysql
+          - --protocol=socket
+          - --socket=/var/run/mysqld/mysqld.sock
+          - -uroot
+          - -NBe
+          - >-
+            SELECT COUNT(*) FROM performance_schema.replication_connection_status c
+            JOIN performance_schema.replication_applier_status a
+            WHERE c.SERVICE_STATE='ON' AND a.SERVICE_STATE='ON'
+      register: _recovery_replication_threads
+      until: _recovery_replication_threads.stdout | trim | int == 1
+      retries: 60
+      delay: 5
+      changed_when: false
+      no_log: true
+      when: inventory_hostname != mysql_primary_host
+
+    - name: Recovery | Confirm final one-primary topology and active replica threads
+      ansible.builtin.uri:
+        url: "http://{{ node_ip }}:{{ orchestrator_http_port }}/api/cluster/alias/{{ mysql_cluster_alias }}"
+        user: "{{ orchestrator_http_user }}"
+        password: "{{ orchestrator_http_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _recovery_final_topology
+      until:
+        - _recovery_final_topology.json | length == groups['mysql_cluster'] | length
+        - (_recovery_final_topology.json | selectattr('ReadOnly', 'equalto', false) | list | length) == 1
+      retries: 36
+      delay: 5
+      no_log: true

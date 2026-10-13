@@ -1,0 +1,44 @@
+from mysqlsh import mysql
+
+ROOT_PASS = {{ mysql_root_password | to_json }}
+ADMIN_USER = {{ mysql_cluster_admin_user | to_json }}
+ADMIN_PASS = {{ mysql_cluster_admin_password | to_json }}
+ADMIN_HOST = {{ mysql_admin_account_host | to_json }}
+ADMIN_ACCOUNT = {{ ("'" ~ mysql_cluster_admin_user ~ "'@'" ~ mysql_admin_account_host ~ "'") | to_json }}
+ROOT_CONNECTION = {
+    "scheme": "mysql", "socket": "/var/run/mysqld/mysqld.sock",
+    "user": "root", "password": ROOT_PASS,
+}
+
+# configure_instance rejects clusterAdminPassword if the account already
+# exists, so only pass account-creation options on the first convergence run.
+session = mysql.get_session({
+    "scheme": "mysql", "socket": "/var/run/mysqld/mysqld.sock", "user": "root",
+}, ROOT_PASS)
+local_member = bool(session.run_sql(
+    "SELECT COUNT(*) FROM performance_schema.replication_group_members "
+    "WHERE MEMBER_ID IS NOT NULL AND MEMBER_ID <> '' "
+    "AND MEMBER_HOST = @@report_host AND MEMBER_PORT = @@port",
+).fetch_one()[0])
+admin_account_exists = bool(session.run_sql(
+    "SELECT COUNT(*) FROM mysql.user WHERE user = ? AND host = ?",
+    [ADMIN_USER, ADMIN_HOST],
+).fetch_one()[0])
+session.close()
+
+if local_member:
+    print("INSTANCE_ALREADY_CLUSTER_MEMBER; configure_instance skipped")
+else:
+    options = {"restart": False, "applierWorkerThreads": 4}
+    if admin_account_exists:
+        print("ADMIN_ACCOUNT_EXISTS; reusing existing account")
+        options["clusterAdmin"] = ADMIN_ACCOUNT
+    else:
+        options.update({
+            "clusterAdmin": ADMIN_ACCOUNT,
+            "clusterAdminPassword": ADMIN_PASS,
+            "clusterAdminPasswordExpiration": "NEVER",
+        })
+
+    dba.configure_instance(ROOT_CONNECTION, options)
+    print("INSTANCE_CONFIGURED")

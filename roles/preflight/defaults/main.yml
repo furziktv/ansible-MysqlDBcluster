@@ -1,0 +1,7 @@
+---
+# preflight defaults (thresholds come from group_vars/all.yml)
+preflight_conflicting_ports:
+  - "{{ mysql_port }}"
+  - "{{ mysql_x_port }}"
+  - "{{ orchestrator_http_port }}"
+  - "{{ orchestrator_raft_port }}"

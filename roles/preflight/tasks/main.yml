@@ -1,0 +1,358 @@
+---
+- name: Preflight | Validate VIP value and network membership
+  ansible.builtin.assert:
+    that:
+      - mysql_vip is defined
+      - mysql_vip != 'CHANGE_ME'
+      - mysql_vip | ipv4_address_valid
+      - mysql_cluster_network_cidr is defined
+      - mysql_vip | ipv4_in_cidr(mysql_cluster_network_cidr)
+      - mysql_vip not in cluster_nodes
+      - mysql_vip_cidr | int == (mysql_cluster_network_cidr | ipv4_cidr_prefix | int)
+    fail_msg: "Set mysql_vip to an unused address in {{ mysql_cluster_network_cidr }} and match its prefix before deployment."
+  run_once: true
+  become: false
+  tags: [preflight]
+
+- name: Preflight | Validate Vault values
+  ansible.builtin.assert:
+    that:
+      - vault_mysql_root_password is defined
+      - vault_mysql_cluster_admin_password is defined
+      - vault_mysql_replication_password is defined
+      - vault_orchestrator_http_password is defined
+      - vault_mysql_monitor_password is defined
+      - vault_mysql_app_password is defined
+      - vault_keepalived_auth_pass is defined
+      - vault_mysql_root_password | length >= 20
+      - vault_mysql_cluster_admin_password | length >= 20
+      - vault_mysql_replication_password | length >= 20
+      - vault_orchestrator_http_password | length >= 20
+      - vault_mysql_monitor_password | length >= 20
+      - vault_mysql_app_password | length >= 20
+      - vault_keepalived_auth_pass | length >= 8
+      - vault_mysql_root_password is not search('CHANGE_ME|CHANGEME')
+      - vault_mysql_cluster_admin_password is not search('CHANGE_ME|CHANGEME')
+      - vault_mysql_replication_password is not search('CHANGE_ME|CHANGEME|R3place')
+      - vault_orchestrator_http_password is not search('CHANGE_ME|CHANGEME|R3place')
+      - vault_mysql_monitor_password is not search('CHANGE_ME|CHANGEME')
+      - vault_mysql_app_password is not search('CHANGE_ME|CHANGEME')
+      - vault_keepalived_auth_pass is not search('CHANGE_ME|CHANGEME')
+  run_once: true
+  become: false
+  no_log: true
+  tags: [preflight]
+
+- name: Preflight | Validate database node addresses belong to the configured subnet
+  ansible.builtin.assert:
+    that:
+      - item | ipv4_in_cidr(mysql_cluster_network_cidr)
+    fail_msg: "Cluster node address {{ item }} is outside {{ mysql_cluster_network_cidr }}."
+  loop: "{{ cluster_nodes }}"
+  run_once: true
+  become: false
+  tags: [preflight]
+
+- name: Preflight | Require explicit SSH management network allowlist
+  ansible.builtin.assert:
+    that:
+      - ssh_trusted_networks is defined
+      - ssh_trusted_networks | length > 0
+    fail_msg: "Set ssh_trusted_networks to the controller/administrator source CIDR(s); SSH will not be opened to the world."
+  run_once: true
+  become: false
+  tags: [preflight]
+
+- name: Preflight | Validate SSH management CIDR values
+  ansible.builtin.assert:
+    that:
+      - item != 'CHANGE_ME'
+      - item is search('/')
+      - item | ip_cidr_valid
+    fail_msg: "Invalid ssh_trusted_networks entry {{ item }}; use a real IPv4/IPv6 CIDR containing the controller."
+  loop: "{{ ssh_trusted_networks }}"
+  run_once: true
+  become: false
+  tags: [preflight]
+
+- name: Preflight | Require at least one MySQL client network
+  ansible.builtin.assert:
+    that:
+      - mysql_trusted_networks is defined
+      - mysql_trusted_networks | length > 0
+    fail_msg: "Define at least one trusted client CIDR in mysql_trusted_networks."
+  run_once: true
+  become: false
+  tags: [preflight]
+
+- name: Preflight | Validate MySQL client CIDR values
+  ansible.builtin.assert:
+    that:
+      - item is search('/')
+      - item | ip_cidr_valid
+    fail_msg: "Invalid mysql_trusted_networks entry {{ item }}; use a valid network CIDR."
+  loop: "{{ mysql_trusted_networks }}"
+  run_once: true
+  become: false
+  tags: [preflight]
+
+- name: Preflight | Require supported Ubuntu or Debian release
+  ansible.builtin.assert:
+    that:
+      - (ansible_distribution == 'Ubuntu' and ansible_distribution_major_version in ['22', '24'])
+        or (ansible_distribution == 'Debian' and ansible_distribution_major_version == '12')
+      - ansible_architecture == 'x86_64'
+    fail_msg: "Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_version }}. Pinned Docker packages support Ubuntu 22.04/24.04 and Debian 12 only."
+  tags: [preflight]
+
+- name: Preflight | Require expected hostname, valid node IP, and unique IDs
+  ansible.builtin.assert:
+    that:
+      - node_ip is defined
+      - node_ip in cluster_nodes
+      - mysql_server_id is defined
+      - mysql_server_id | int > 0
+      - inventory_hostname in ['db01', 'db02', 'db03']
+      - node_ip in ansible_all_ipv4_addresses
+    fail_msg: "Inventory hostname, node_ip, server ID, or host address is invalid on {{ inventory_hostname }}."
+  tags: [preflight]
+
+- name: Preflight | Confirm three distinct server IDs
+  ansible.builtin.assert:
+    that:
+      - groups['mysql_cluster'] | length == 3
+      - groups['mysql_cluster'] | map('extract', hostvars, 'mysql_server_id') | unique | length == 3
+      - mysql_primary_host in groups['mysql_cluster']
+    fail_msg: "Require exactly db01/db02/db03 with distinct server IDs and mysql_primary_host set to a member."
+  run_once: true
+  tags: [preflight]
+
+- name: Preflight | Require minimum free space on root filesystem
+  ansible.builtin.assert:
+    that:
+      - ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | int >= preflight_min_disk_gb | int * 1024**3
+    fail_msg: >-
+      Insufficient free disk space on {{ inventory_hostname }}: requires at least
+      {{ preflight_min_disk_gb }} GiB available on /. Check the disk/partition
+      sizing before deployment.
+  tags: [preflight]
+
+- name: Preflight | Require minimum RAM
+  ansible.builtin.assert:
+    that:
+      - ansible_memtotal_mb | int >= preflight_min_ram_mb | int
+    fail_msg: >-
+      Insufficient RAM on {{ inventory_hostname }}: Ansible detected
+      {{ ansible_memtotal_mb }} MiB, while this deployment requires at least
+      {{ preflight_min_ram_mb }} MiB per node. Increase each server's RAM; do
+      not lower this safety threshold without revalidating the MySQL memory
+      configuration and workload requirements.
+  tags: [preflight]
+
+- name: Preflight | Measure free space on the /srv filesystem
+  ansible.builtin.command:
+    argv: [df, -k, --output=avail, /srv]
+  register: _preflight_srv_space
+  changed_when: false
+  tags: [preflight]
+
+- name: Preflight | Require enough capacity for persistent database data
+  ansible.builtin.assert:
+    that:
+      - _preflight_srv_space.stdout_lines | last | int >= preflight_min_disk_gb | int * 1024 * 1024
+    fail_msg: "Insufficient free space on the filesystem containing /srv/mysql on {{ inventory_hostname }}."
+  tags: [preflight]
+
+- name: Preflight | Detect unexpected pre-existing data
+  ansible.builtin.find:
+    paths: "{{ mysql_data_dir }}"
+    hidden: true
+    file_type: any
+    recurse: false
+  register: _preflight_data_files
+  failed_when: false
+  tags: [preflight]
+
+- name: Preflight | Inspect data directory path without following symlinks
+  ansible.builtin.stat:
+    path: "{{ mysql_data_dir }}"
+    follow: false
+  register: _preflight_data_path
+  tags: [preflight]
+
+- name: Preflight | Refuse symlinked persistent data path
+  ansible.builtin.assert:
+    that: not (_preflight_data_path.stat.islnk | default(false))
+    fail_msg: "MANUAL INTERVENTION REQUIRED: {{ mysql_data_dir }} is a symlink; verify the actual persistent storage location."
+  tags: [preflight]
+
+- name: Preflight | Inspect project ownership marker
+  ansible.builtin.stat:
+    path: "{{ mysql_managed_marker }}"
+  register: _preflight_marker
+  tags: [preflight]
+
+- name: Preflight | Inspect initialized MySQL server identity
+  ansible.builtin.stat:
+    path: "{{ mysql_data_dir }}/auto.cnf"
+  register: _preflight_mysql_initialized
+  tags: [preflight]
+
+- name: Preflight | Inspect existing Docker containers when Docker is installed
+  ansible.builtin.shell: |
+    if ! command -v docker >/dev/null 2>&1; then
+      echo __DOCKER_NOT_INSTALLED__
+    else
+      docker ps -a --format '{{'{{'}}.Names{{'}}'}}'
+    fi
+  args:
+    executable: /bin/bash
+  register: _preflight_docker_containers
+  changed_when: false
+  failed_when: _preflight_docker_containers.rc != 0
+  tags: [preflight]
+
+- name: Preflight | Refuse an existing project-named container without ownership marker
+  ansible.builtin.assert:
+    that:
+      - _preflight_marker.stat.exists or mysql_container_name not in _preflight_docker_containers.stdout_lines
+      - _preflight_marker.stat.exists or 'mysql-router' not in _preflight_docker_containers.stdout_lines
+      - _preflight_marker.stat.exists or 'orchestrator' not in _preflight_docker_containers.stdout_lines
+    fail_msg: >-
+      MANUAL INTERVENTION REQUIRED: a container named {{ mysql_container_name }} or
+      mysql, mysql-router, or orchestrator exists without {{ mysql_managed_marker }}. Inspect it before continuing.
+      Identify and back up its data before proceeding.
+  tags: [preflight]
+
+- name: Preflight | Refuse to adopt unrecognized MySQL data
+  ansible.builtin.assert:
+    that:
+      - (_preflight_data_files.matched | default(0) | int == 0) or _preflight_marker.stat.exists
+    fail_msg: >-
+      MANUAL INTERVENTION REQUIRED: {{ mysql_data_dir }} contains files but has no
+      {{ mysql_managed_marker }} marker. Back up and identify the data before deployment.
+      Ansible will not initialize, attach, overwrite, or remove it automatically.
+  tags: [preflight]
+
+- name: Preflight | Check required TCP ports on uninitialized hosts
+  ansible.builtin.command:
+    argv: [ss, -lntH, "( sport = :{{ item }} )"]
+  loop:
+    - "{{ mysql_port }}"
+    - "{{ mysql_x_port }}"
+    - "{{ orchestrator_http_port }}"
+    - "{{ orchestrator_raft_port }}"
+  register: _preflight_port_listeners
+  changed_when: false
+  when: not _preflight_marker.stat.exists
+  tags: [preflight]
+
+- name: Preflight | Refuse required ports already bound by another service
+  ansible.builtin.assert:
+    that: item.stdout | trim | length == 0
+    fail_msg: "Port conflict on {{ inventory_hostname }}: TCP port {{ item.item }} already has a listener."
+  loop: "{{ _preflight_port_listeners.results | default([]) }}"
+  when: not _preflight_marker.stat.exists
+  tags: [preflight]
+
+- name: Preflight | Detect VIP already assigned to a cluster node
+  ansible.builtin.command:
+    argv: [ip, -o, -4, addr, show]
+  register: _preflight_local_addresses
+  changed_when: false
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['mysql_cluster'] }}"
+  run_once: true
+  tags: [preflight]
+
+- name: Preflight | Detect VIP network interface
+  ansible.builtin.command:
+    argv: [ip, -o, -4, route, show, to, default]
+  register: _preflight_default_route
+  changed_when: false
+  delegate_to: "{{ groups['mysql_cluster'][0] }}"
+  run_once: true
+  tags: [preflight]
+
+- name: Preflight | Set detected VIP interface
+  ansible.builtin.set_fact:
+    _mysql_preflight_interface: "{{ mysql_vip_interface if not (mysql_vip_interface_autodetect | bool) else (_preflight_default_route.stdout | regex_search('dev\\s+(\\S+)', '\\1') | first) }}"
+  run_once: true
+  tags: [preflight]
+
+- name: Preflight | Ensure iputils ARP probe is installed on bootstrap node
+  ansible.builtin.apt:
+    name: iputils-arping
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  delegate_to: "{{ groups['mysql_cluster'][0] }}"
+  run_once: true
+  tags: [preflight]
+
+- name: Preflight | Verify VIP is unused when not already managed by this cluster
+  ansible.builtin.command:
+    argv: [arping, -D, -c, "2", -w, "3", -I, "{{ _mysql_preflight_interface }}", "{{ mysql_vip }}"]
+  register: _preflight_vip_probe
+  changed_when: false
+  failed_when: false
+  when: _preflight_local_addresses.results | map(attribute='stdout') | join(' ') is not search(mysql_vip)
+  run_once: true
+  tags: [preflight]
+
+- name: Preflight | Require successful duplicate-address detection
+  ansible.builtin.assert:
+    that:
+      - _preflight_vip_probe.rc == 0
+    fail_msg: >-
+      VIP duplicate-address probe did not succeed on interface
+      {{ _mysql_preflight_interface }} for {{ mysql_vip }}.
+      arping exit code={{ _preflight_vip_probe.rc }}.
+      Exit code 1 means an ARP reply was received (VIP may already be in use);
+      exit code 2 means the probe itself failed (check that the interface is
+      UP/on the VIP's Layer-2 network and that root has CAP_NET_RAW).
+      stdout={{ _preflight_vip_probe.stdout | default('') | trim }};
+      stderr={{ _preflight_vip_probe.stderr | default('') | trim }}.
+      No hosts were changed; verify with
+      `sudo arping -D -c 2 -w 3 -I {{ _mysql_preflight_interface }} {{ mysql_vip }}`
+      before retrying.
+  when: _preflight_vip_probe is not skipped
+  run_once: true
+  tags: [preflight]
+
+- name: Preflight | Record current system clock
+  ansible.builtin.command: date +%s
+  register: _preflight_epoch
+  changed_when: false
+  tags: [preflight]
+
+- name: Preflight | Verify time synchronization daemon is active
+  ansible.builtin.command: timedatectl show -p NTPSynchronized --value
+  register: _preflight_ntp
+  changed_when: false
+  failed_when: _preflight_ntp.rc != 0 or _preflight_ntp.stdout | trim != 'yes'
+  tags: [preflight]
+
+- name: Preflight | Require clocks within configured skew
+  ansible.builtin.assert:
+    that:
+      - (groups['mysql_cluster'] | map('extract', hostvars, '_preflight_epoch') | map(attribute='stdout') | map('int') | max) - (groups['mysql_cluster'] | map('extract', hostvars, '_preflight_epoch') | map(attribute='stdout') | map('int') | min) <= preflight_max_clock_skew_seconds | int
+    fail_msg: "Cluster node clock skew exceeds {{ preflight_max_clock_skew_seconds }} seconds."
+  run_once: true
+  tags: [preflight]
+
+- name: Preflight | Check peer MySQL connectivity for existing replication topology
+  ansible.builtin.wait_for:
+    host: "{{ hostvars[item.0].node_ip }}"
+    port: "{{ item.1 }}"
+    timeout: 4
+    state: started
+  loop: "{{ groups['mysql_cluster'] | product([mysql_port]) | list }}"
+  when:
+    - item.0 != inventory_hostname
+    # .ansible-managed only records project ownership and remains present when
+    # an empty datadir is reinitialized. Require peer listeners only after all
+    # MySQL datadirs have an initialized server UUID (auto.cnf).
+    - (groups['mysql_cluster'] | map('extract', hostvars, '_preflight_mysql_initialized') | map(attribute='stat.exists') | min) == true
+  register: _preflight_peer_ports
+  tags: [preflight]

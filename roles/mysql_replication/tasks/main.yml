@@ -1,0 +1,316 @@
+---
+- name: Replication | Inspect one-time topology markers
+  ansible.builtin.stat:
+    path: "/srv/mysql/{{ 'replication-seed-ready' if inventory_hostname == mysql_primary_host else 'replication-replica-ready' }}"
+  register: _replication_ready_marker
+  tags: [replication]
+
+- name: Replication | Require explicit first-time topology initialization
+  ansible.builtin.assert:
+    that: confirm_mysql_replication_bootstrap == 'YES_INITIALIZE_ASYNC_REPLICATION'
+    fail_msg: >-
+      REFUSED: this node has no async-replication ownership marker. After
+      verifying that all VM datadirs are fresh and contain no data to preserve,
+      pass -e confirm_mysql_replication_bootstrap=YES_INITIALIZE_ASYNC_REPLICATION
+      for the one-time seed/replica setup.
+  when: not _replication_ready_marker.stat.exists
+  tags: [replication]
+
+- name: Replication | Refuse conversion of a live Group Replication instance
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ mysql_container_name }}"
+      - mysql
+      - --protocol=socket
+      - --socket=/var/run/mysqld/mysqld.sock
+      - -uroot
+      - "-p{{ mysql_root_password }}"
+      - -NBe
+      - "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_ID IS NOT NULL AND MEMBER_ID <> ''"
+  register: _replication_gr_members
+  changed_when: false
+  failed_when: false
+  no_log: true
+  tags: [replication]
+
+- name: Replication | Require no existing Group Replication membership
+  ansible.builtin.assert:
+    that:
+      - _replication_gr_members.rc == 0
+      - _replication_gr_members.stdout | trim | int == 0
+    fail_msg: >-
+      {% if _replication_gr_members.rc != 0 %}
+      CANNOT VERIFY Group Replication state: the local MySQL query failed
+      (rc={{ _replication_gr_members.rc }}). Check that the mounted root
+      credential matches the initialized MySQL account and that the local
+      socket is available. No topology changes were made.
+      {% else %}
+      REFUSED: live Group Replication membership exists. Do not change config
+      under a running cluster. Use the documented migration procedure after
+      taking a verified backup and explicitly stopping the old topology.
+      {% endif %}
+  tags: [replication]
+
+- name: Replication | Initialize the writable seed and replication accounts
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -i
+      - -e
+      - "MYSQL_PWD={{ mysql_root_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - --protocol=socket
+      - --socket=/var/run/mysqld/mysqld.sock
+      - -uroot
+    stdin: "{{ lookup('ansible.builtin.template', 'seed_primary.sql.j2') }}"
+  register: _replication_seed_sql
+  changed_when: _replication_seed_sql.rc == 0
+  failed_when: false
+  when:
+    - inventory_hostname == mysql_primary_host
+    - not _replication_ready_marker.stat.exists
+  no_log: true
+  tags: [replication]
+
+- name: Replication | Require seed initialization SQL to succeed
+  ansible.builtin.assert:
+    that: _replication_seed_sql.rc == 0
+    fail_msg: >-
+      Seed initialization SQL failed on {{ inventory_hostname }}
+      (rc={{ _replication_seed_sql.rc }}):
+      {{ _replication_seed_sql.stderr | default('no MySQL client error text') | trim }}
+      SQL contents and credential values remain hidden.
+  when:
+    - inventory_hostname == mysql_primary_host
+    - not _replication_ready_marker.stat.exists
+  tags: [replication]
+
+- name: Replication | Ensure Orchestrator has SHOW REPLICAS privilege on primary
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -i
+      - -e
+      - "MYSQL_PWD={{ mysql_root_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - --protocol=socket
+      - --socket=/var/run/mysqld/mysqld.sock
+      - -uroot
+    stdin: >-
+      GRANT PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE,
+      REPLICATION_SLAVE_ADMIN, SYSTEM_VARIABLES_ADMIN, CONNECTION_ADMIN
+      ON *.* TO '{{ mysql_orchestrator_user }}'@'{{ mysql_admin_account_host }}';
+      GRANT SELECT ON mysql.slave_master_info
+      TO '{{ mysql_orchestrator_user }}'@'{{ mysql_admin_account_host }}';
+  register: _orchestrator_replication_grant
+  changed_when: _orchestrator_replication_grant.rc == 0
+  no_log: true
+  when: inventory_hostname == mysql_primary_host
+  tags: [replication]
+
+- name: Replication | Require Orchestrator privilege repair to succeed
+  ansible.builtin.assert:
+    that: _orchestrator_replication_grant.rc == 0
+    fail_msg: "Could not update the Orchestrator topology account privileges on the primary."
+  when: inventory_hostname == mysql_primary_host
+  tags: [replication]
+
+- name: Replication | Record successful seed initialization
+  ansible.builtin.copy:
+    dest: /srv/mysql/replication-seed-ready
+    content: "Async replication seed initialized by Ansible. Preserve this marker.\n"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - inventory_hostname == mysql_primary_host
+    - not _replication_ready_marker.stat.exists
+  tags: [replication]
+
+- name: Replication | Inspect configured replication source on replica candidates
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "MYSQL_PWD={{ mysql_root_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - --protocol=socket
+      - --socket=/var/run/mysqld/mysqld.sock
+      - -uroot
+      - -NBe
+      - "SELECT COALESCE((SELECT HOST FROM performance_schema.replication_connection_configuration LIMIT 1), '')"
+  register: _replication_source
+  changed_when: false
+  when:
+    - inventory_hostname != mysql_primary_host
+    - not _replication_ready_marker.stat.exists
+  no_log: true
+  tags: [replication]
+
+- name: Replication | Refuse an unexpected pre-existing source
+  ansible.builtin.assert:
+    that:
+      - _replication_source.stdout | trim == '' or _replication_source.stdout | trim == hostvars[mysql_primary_host].node_ip
+    fail_msg: >-
+      MANUAL INTERVENTION REQUIRED: this replica already has a different
+      replication source. No RESET REPLICA or source change was attempted.
+  when:
+    - inventory_hostname != mysql_primary_host
+    - not _replication_ready_marker.stat.exists
+  no_log: true
+  tags: [replication]
+
+- name: Replication | Configure GTID auto-position and start replica
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -i
+      - -e
+      - "MYSQL_PWD={{ mysql_root_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - --protocol=socket
+      - --socket=/var/run/mysqld/mysqld.sock
+      - -uroot
+    stdin: "{{ lookup('ansible.builtin.template', 'start_replica.sql.j2') }}"
+  register: _replication_start
+  changed_when: true
+  when:
+    - inventory_hostname != mysql_primary_host
+    - not _replication_ready_marker.stat.exists
+    - _replication_source.stdout | trim == ''
+  no_log: true
+  tags: [replication]
+
+- name: Replication | Wait for both replication threads to run
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "MYSQL_PWD={{ mysql_root_password }}"
+      - "{{ mysql_container_name }}"
+      - mysql
+      - --protocol=socket
+      - --socket=/var/run/mysqld/mysqld.sock
+      - -uroot
+      - -NBe
+      - >-
+        SELECT COUNT(*) FROM performance_schema.replication_connection_status c
+        JOIN performance_schema.replication_applier_status a
+        WHERE c.SERVICE_STATE='ON' AND a.SERVICE_STATE='ON'
+  register: _replication_threads
+  until: _replication_threads.stdout | trim | int == 1
+  retries: 30
+  delay: 5
+  changed_when: false
+  when:
+    - inventory_hostname != mysql_primary_host
+    - not _replication_ready_marker.stat.exists
+  no_log: true
+  tags: [replication]
+
+- name: Replication | Record successful replica initialization
+  ansible.builtin.copy:
+    dest: /srv/mysql/replication-replica-ready
+    content: "Async replication replica initialized by Ansible. Preserve this marker.\n"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - inventory_hostname != mysql_primary_host
+    - not _replication_ready_marker.stat.exists
+  tags: [replication]
+
+# Safe automatic rejoin is deliberately separate from one-time topology
+# bootstrap. It never resets replication state or modifies the datadir.
+- name: Safe rejoin | Ensure private secrets directory exists
+  ansible.builtin.file:
+    path: "{{ mysql_secrets_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  tags: [safe_rejoin]
+
+- name: Safe rejoin | Install replication credential
+  ansible.builtin.copy:
+    dest: "{{ mysql_secrets_dir }}/mysql_replication_password"
+    content: "{{ mysql_replication_password }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  tags: [safe_rejoin]
+
+- name: Safe rejoin | Install guarded rejoin controller
+  ansible.builtin.template:
+    src: safe_rejoin.py.j2
+    dest: /usr/local/sbin/mysql-safe-rejoin
+    owner: root
+    group: root
+    mode: "0700"
+  tags: [safe_rejoin]
+
+- name: Safe rejoin | Install systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/mysql-safe-rejoin.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Guarded MySQL replica rejoin and primary resumption
+      After=docker.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      User=root
+      ExecStart=/usr/local/sbin/mysql-safe-rejoin
+      TimeoutStartSec=30
+      NoNewPrivileges=true
+      PrivateTmp=true
+      ProtectHome=true
+  register: _safe_rejoin_service
+  tags: [safe_rejoin]
+
+- name: Safe rejoin | Install periodic systemd timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/mysql-safe-rejoin.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Periodically attempt guarded MySQL topology recovery
+
+      [Timer]
+      OnBootSec=60s
+      OnUnitActiveSec=30s
+      AccuracySec=5s
+      Persistent=true
+      Unit=mysql-safe-rejoin.service
+
+      [Install]
+      WantedBy=timers.target
+  register: _safe_rejoin_timer
+  tags: [safe_rejoin]
+
+- name: Safe rejoin | Reload systemd and enable the timer
+  ansible.builtin.systemd:
+    name: mysql-safe-rejoin.timer
+    daemon_reload: true
+    enabled: true
+    state: started
+  when: _safe_rejoin_service.changed or _safe_rejoin_timer.changed
+  tags: [safe_rejoin]

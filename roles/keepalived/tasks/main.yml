@@ -1,0 +1,70 @@
+---
+# keepalived role: host-package VRRP (more reliable than containerized
+# keepalived for multicast + host interface access). VIP floats to a
+# node confirmed as the current writable root by local Orchestrator.
+- name: Keepalived | Detect default interface when autodetect enabled
+  ansible.builtin.command: "ip -o -4 route show to default"
+  register: _ka_default_route
+  changed_when: false
+  tags: [keepalived]
+
+- name: Keepalived | Require a default route when interface auto-detection is enabled
+  ansible.builtin.assert:
+    that: not (mysql_vip_interface_autodetect | bool) or (_ka_default_route.stdout is search('dev\\s+\\S+'))
+    fail_msg: "MANUAL INTERVENTION REQUIRED: cannot determine the VIP network interface. Set mysql_vip_interface explicitly after checking routing."
+  tags: [keepalived]
+
+- name: Keepalived | Set effective interface fact
+  ansible.builtin.set_fact:
+    keepalived_effective_interface: >-
+      {{ (_ka_default_route.stdout.split(' dev ')[1].split()[0])
+         if (mysql_vip_interface_autodetect | bool) and (' dev ' in _ka_default_route.stdout)
+         else mysql_vip_interface }}
+  tags: [keepalived]
+
+- name: Keepalived | Ensure keepalived installed (via common, verify here)
+  ansible.builtin.apt:
+    name:
+      - keepalived
+      - jq
+      - curl
+    state: present
+  tags: [keepalived]
+
+- name: Keepalived | Deploy primary health-check script
+  ansible.builtin.template:
+    src: chk_mysql_primary.sh.j2
+    dest: /etc/keepalived/chk_mysql_primary.sh
+    mode: "0755"
+  tags: [keepalived]
+
+- name: Keepalived | Deploy notify script
+  ansible.builtin.copy:
+    dest: /etc/keepalived/notify.sh
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      echo "$(date -Is) keepalived transition to $1 on $(hostname)" | systemd-cat -t keepalived-mysql || true
+  tags: [keepalived]
+
+- name: Keepalived | Render keepalived.conf
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    mode: "0600"
+  no_log: true
+  tags: [keepalived]
+  notify: Restart keepalived
+
+- name: Keepalived | Enable and start keepalived
+  ansible.builtin.systemd:
+    name: keepalived
+    enabled: true
+    state: started
+  tags: [keepalived]
+
+- name: Keepalived | Wait for VIP to appear somewhere (non-fatal informational)
+  ansible.builtin.command: "ip -4 addr show"
+  register: _ka_addrs
+  changed_when: false
+  tags: [keepalived]

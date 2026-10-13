@@ -1,0 +1,132 @@
+---
+# ============================================================
+# MySQL InnoDB Cluster — global variables
+# All versions are pinned. Never use `latest`.
+# ============================================================
+
+# --- Pinned component versions (compatibility verified) ---
+# MySQL Server 8.4 LTS with separately pinned compatible Shell/Router releases.
+mysql_version: "8.4.12"
+mysql_image: "container-registry.oracle.com/mysql/community-server:{{ mysql_version }}"
+# The pinned community-server image packages this exact MySQL Shell release.
+# Reuse it for short-lived AdminAPI containers to avoid a separately gated OCR repo.
+mysql_shell_version: "26.7.1"
+mysql_shell_image: "{{ mysql_image }}"
+mysql_router_version: "26.7.0"
+mysql_router_image: "container-registry.oracle.com/mysql/community-router:{{ mysql_router_version }}"
+
+# Docker packages are pinned per supported distribution release because
+# Debian and Ubuntu publish differently versioned builds.
+docker_engine_package_versions:
+  Ubuntu:
+    "22": "5:29.8.0-1~ubuntu.22.04~jammy"
+    "24": "5:29.8.0-1~ubuntu.24.04~noble"
+  Debian:
+    "12": "5:29.8.1-1~debian.12~bookworm"
+containerd_package_versions:
+  Ubuntu:
+    "22": "2.3.6-1~ubuntu.22.04~jammy"
+    "24": "2.3.6-1~ubuntu.24.04~noble"
+  Debian:
+    "12": "2.3.6-1~debian.12~bookworm"
+docker_compose_package_versions:
+  Ubuntu:
+    "22": "5.5.1-1~ubuntu.22.04~jammy"
+    "24": "5.5.1-1~ubuntu.24.04~noble"
+  Debian:
+    "12": "5.5.1-1~debian.12~bookworm"
+
+# --- Cluster identity ---
+mysql_cluster_name: "prodCluster"
+# Fixed group name UUID — generated once, must never change for
+# the lifetime of the cluster. (uuidgen output stored here.)
+mysql_group_name: "a52d7f2e-1c3b-4e5f-9a6b-7c8d9e0f1a2b"
+mysql_group_seeds: "10.100.0.1:33061,10.100.0.2:33061,10.100.0.3:33061"
+
+# --- Networking / ports ---
+mysql_port: 3306
+mysql_x_port: 33060
+mysql_group_replication_port: 33061
+mysql_router_write_port: 6446
+mysql_router_read_port: 6447
+mysql_router_rw_split_port: 6450
+keepalived_vrrp_priority_base: 100
+
+# Single client endpoint. MUST be replaced before deploy.
+# The database hosts report 10.100.0.0/16; use an IP from that subnet that is
+# not used/reserved by any host. Preflight checks duplicate use on the LAN.
+mysql_cluster_network_cidr: "10.100.1.1/24"
+mysql_vip: "10.100.0.5"
+mysql_vip_cidr: 16
+mysql_vip_interface: "eth0"
+# Auto-detect interface if eth0 does not exist (see keepalived role).
+mysql_vip_interface_autodetect: true
+
+# Networks allowed to reach MySQL client ports (Router RW/RO + 3306 for admin).
+# Group replication port 33061 is allowed ONLY between cluster nodes.
+mysql_trusted_networks:
+  # Keep client access narrower than the L2 subnet unless applications require more.
+  - "10.100.1.1/24"
+# Do not open SSH globally. Replace this with the controller/admin CIDR(s).
+ssh_trusted_networks:
+  - "10.100.1.1/24"
+cluster_nodes:
+  - "10.100.0.1"
+  - "10.100.0.2"
+  - "10.100.0.3"
+
+# --- Persistent storage (bind mounts, never anonymous volumes) ---
+mysql_data_dir: "/srv/mysql/data"
+mysql_config_dir: "/srv/mysql/config"
+mysql_secrets_dir: "/srv/mysql/secrets"
+mysql_router_dir: "/srv/mysql/router"
+mysql_logs_dir: "/srv/mysql/logs"
+mysql_run_dir: "/srv/mysql/run"
+mysql_compose_dir: "/srv/mysql"
+mysql_compose_file: "/srv/mysql/docker-compose.yml"
+mysql_container_name: "mysql"
+mysql_router_container_name: "mysql-router"
+# Verified from the pinned Oracle community-server:8.4.12 image.
+mysql_container_uid: 27
+mysql_container_gid: 27
+
+# --- MySQL accounts (passwords live in group_vars/vault.yml) ---
+mysql_root_password: "{{ vault_mysql_root_password }}"
+mysql_cluster_admin_user: "clusteradmin"
+mysql_cluster_admin_password: "{{ vault_mysql_cluster_admin_password }}"
+# Router bootstrap creates its own least-privilege metadata account.
+mysql_monitor_user: "monitor"
+mysql_monitor_password: "{{ vault_mysql_monitor_password }}"
+mysql_app_user: "appuser"
+mysql_app_password: "{{ vault_mysql_app_password }}"
+mysql_app_database: "appdb"
+mysql_app_account_host: "10.100.0.%"
+mysql_admin_account_host: "10.100.0.%"
+
+# --- Host requirements (preflight thresholds) ---
+preflight_min_disk_gb: 10
+# Lowered to fit the operators' existing nodes (about 1968 MiB MemTotal).
+# Keep a safety margin; do not lower further without re-evaluating MySQL memory.
+preflight_min_ram_mb: 1900
+preflight_max_clock_skew_seconds: 5
+
+# --- Docker logging ---
+docker_log_max_size: "10m"
+docker_log_max_file: "3"
+
+# --- OS assumptions ---
+supported_distros:
+  - { name: "Ubuntu", min_major: 22 }
+  - { name: "Debian", min_major: 12 }
+
+# --- Safety switches (destroy / reclone) ---
+# Must be passed explicitly on the CLI, never set to YES here.
+confirm_destroy_cluster: "NO"
+confirm_destroy_data: "NO"
+confirm_reclone_instance: "NO"
+recovery_target: ""
+recovery_clone_donor: ""
+
+# Existing non-empty data without this project marker is never adopted
+# implicitly. See the preflight role.
+mysql_managed_marker: "/srv/mysql/.ansible-managed"

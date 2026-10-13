@@ -1,0 +1,29 @@
+# Secrets - never commit real credentials
+group_vars/vault.yml
+.vault_pass
+.vault-password-file
+*.vault
+*.key
+*.pem
+
+# Ansible runtime
+*.retry
+*.log
+.cache/
+ molecule/
+
+# MySQL local data (safety: never commit dumps)
+dump.sql
+*.sql.gz
+
+# OS / editor
+.DS_Store
+*~
+*.swp
+.vscode/
+.idea/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
